@@ -4,135 +4,139 @@
 
 ## Linux
 
-Linux 系统有多种防火墙管理工具，这里介绍三种常见的工具：`ufw`，`firewalld` 和 `iptables`。
+Linux 系统有多种防火墙管理工具。不同发行版默认的工具不同，本节按发行版分类介绍。
 
-### UFW (Uncomplicated Firewall) - (Debian/Ubuntu)
+### Ubuntu / Debian (使用 UFW)
 
-UFW 是一个旨在简化 `iptables` 操作的用户友好前端。
+Ubuntu 和 Debian 默认使用 `ufw` (Uncomplicated Firewall)，它是一个旨在简化 `iptables` 操作的用户友好前端。
 
-**1. 检查状态**
+**1. 启动与停止**
 ```bash
-sudo ufw status
-```
-
-**2. 启用/禁用防火墙**
-```bash
-# 启用
+# 启用防火墙并设置开机自启
 sudo ufw enable
 
-# 禁用
+# 禁用防火墙
 sudo ufw disable
 ```
 
-**3. 设置默认策略**
+**2. 状态查看**
 ```bash
-# 拒绝所有传入连接
-sudo ufw default deny incoming
+# 查看基本状态
+sudo ufw status
 
-# 允许所有传出连接
-sudo ufw default allow outgoing
+# 查看带编号的规则列表
+sudo ufw status numbered
 ```
 
-**4. 允许/拒绝连接**
+**3. 增删端口策略**
 ```bash
-# 允许特定端口 (例如：SSH)
+# 允许外部访问 22/tcp 端口 (SSH)
 sudo ufw allow 22/tcp
 
-# 允许特定服务 (例如：HTTP)
+# 允许外部访问 80/tcp 端口 (HTTP)
 sudo ufw allow http
 
-# 允许来自特定 IP 地址的连接
-sudo ufw allow from 192.168.1.100
-
-# 拒绝特定端口
+# 拒绝外部访问 8080 端口
 sudo ufw deny 8080/tcp
-```
 
-**5. 删除规则**
-```bash
-# 列出规则并显示编号
-sudo ufw status numbered
-
-# 根据编号删除规则
+# 删除第一条规则 (先用 status numbered 查看编号)
 sudo ufw delete 1
 ```
 
-**6. 重置防火墙**
+**4. 重新加载**
+`ufw` 在每次修改规则后会自动生效，通常不需要手动重载。如果需要重置所有规则并重新加载配置文件，可以使用：
 ```bash
+# 重置防火墙到安装时的默认状态
 sudo ufw reset
+# 然后重新启用
+sudo ufw enable
 ```
 
-### firewalld - (RHEL/CentOS/Fedora)
+### CentOS / RHEL / Fedora (使用 firewalld)
 
-`firewalld` 是一个动态管理的防火墙，支持网络“区域”(zones) 的概念。
+CentOS, RHEL, Fedora 等发行版默认使用 `firewalld`，它支持网络“区域”(zones) 的概念，管理更灵活。
 
-**1. 检查状态**
+**1. 启动与停止**
 ```bash
-sudo firewall-cmd --state
-```
-
-**2. 启用/禁用防火墙**
-```bash
-# 启动并设置为开机自启
+# 启动 firewalld 服务
 sudo systemctl start firewalld
+# 设置 firewalld 开机自启
 sudo systemctl enable firewalld
 
-# 停止并禁用开机自启
+# 停止 firewalld 服务
 sudo systemctl stop firewalld
+# 禁止 firewalld 开机自启
 sudo systemctl disable firewalld
 ```
 
-**3. 管理区域和规则**
+**2. 状态查看**
 ```bash
-# 查看当前区域和规则
+# 查看 firewalld 运行状态
+sudo firewall-cmd --state
+
+# 查看当前区域(默认为 public)的所有配置
 sudo firewall-cmd --list-all
+```
 
-# 允许服务 (临时)
-sudo firewall-cmd --zone=public --add-service=http
+**3. 增删端口策略**
+`firewalld` 的规则分为“临时”和“永久”。临时规则立即生效，但重启后失效。永久规则需要重载后才生效。
 
-# 允许服务 (永久)
-sudo firewall-cmd --zone=public --add-service=http --permanent
-
-# 允许端口 (永久)
+```bash
+# 永久开放 8080/tcp 端口
 sudo firewall-cmd --zone=public --add-port=8080/tcp --permanent
+
+# 永久关闭 8080/tcp 端口
+sudo firewall-cmd --zone=public --remove-port=8080/tcp --permanent
+
+# 永久开放 http 服务 (即 80/tcp)
+sudo firewall-cmd --zone=public --add-service=http --permanent
 ```
 
 **4. 重新加载配置**
-在添加或修改永久规则后，需要重新加载防火墙以使更改生效。
+在修改了永久规则后，必须重新加载配置才能生效。
 ```bash
 sudo firewall-cmd --reload
 ```
 
-### iptables
+### 通用工具: iptables
 
-`iptables` 是一个功能强大但更复杂的工具，用于配置 Linux 内核防火墙。
+`iptables` 是一个功能强大但更复杂的底层工具，适用于所有 Linux 发行版。
 
-**1. 列出规则**
+**1. 状态查看**
 ```bash
+# 以详细、数字化的格式列出所有规则
 sudo iptables -L -v -n
 ```
 
-**2. 允许/拒绝连接**
+**2. 增删端口策略**
 ```bash
-# 允许 SSH 连接
+# 允许入站的 SSH 连接
 sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 
-# 拒绝来自特定 IP 的连接
+# 拒绝来自特定 IP 的所有入站连接
 sudo iptables -A INPUT -s 192.168.1.100 -j DROP
+
+# 删除规则 (需要先找到规则内容和位置)
+# 例如，删除上面添加的 SSH 规则
+sudo iptables -D INPUT -p tcp --dport 22 -j ACCEPT
 ```
 
-**3. 保存规则**
-`iptables` 规则在重启后会丢失。保存规则的方法因发行版而异。
+**3. 启动与停止/重载**
+`iptables` 本身没有启动停止的概念，它是对内核规则的直接修改。规则的持久化依赖于特定发行版的工具。
 
 *   **Debian/Ubuntu:**
     ```bash
+    # 安装工具
     sudo apt-get install iptables-persistent
+    # 保存当前规则
     sudo netfilter-persistent save
     ```
 *   **CentOS/RHEL:**
     ```bash
+    # 保存当前规则
     sudo service iptables save
     ```
+    重载通常意味着清空所有规则链 (`iptables -F`) 然后从保存的文件中重新加载。
 
 ## Windows
 
