@@ -4,12 +4,10 @@
   
 函数抽取前：  
 ![](assets/dpt%20介绍/file-20260106132719306.png)
-  
-![](unnop.png)  
+
   
 函数抽取后：  
 ![](assets/dpt%20介绍/file-20260106132653323.png)
-![](nop.png)  
   
 ## 0x1 项目的结构  
   
@@ -44,9 +42,8 @@ shell模块最终生成的dex文件和so文件将被集成到需要加壳的apk�
   
   
 流程如下：  
+  ![](assets/dpt%20介绍/file-20260106133555032.png)
   
-  
-![](shell.png)  
   
 ## 0x2 processor  
   
