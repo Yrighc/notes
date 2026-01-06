@@ -3,11 +3,11 @@
 函数抽取壳这个词不知道从哪起源的，但我理解的函数抽取壳是那种将dex文件中的函数代码给nop，然后在运行时再把字节码给填回dex的这么一种壳。  
   
 函数抽取前：  
-![](assets/dpt%20介绍/file-20260106132719306.png)
+![](assets/dpt/file-20260106133831462.png)
 
   
 函数抽取后：  
-![](assets/dpt%20介绍/file-20260106132653323.png)
+![](assets/dpt/file-20260106133831463.png)
   
 ## 0x1 项目的结构  
   
@@ -42,7 +42,7 @@ shell模块最终生成的dex文件和so文件将被集成到需要加壳的apk�
   
   
 流程如下：  
-  ![](assets/dpt%20介绍/file-20260106133555032.png)
+  ![](assets/dpt/file-20260106133831459.png)
   
   
 ## 0x2 processor  
@@ -69,11 +69,10 @@ processor比较重要的逻辑两点，AndroidManifest.xml的处理和CodeItem�
     }  
 ```  
   
-### (2) 提取CodeItem  
+### （2） 提取CodeItem  
   
 CodeItem是dex文件中存放函数字节码相关数据的结构。下图显示的就是CodeItem大概的样子。  
-  
-![](codeitem.png)  
+  ![](assets/dpt/file-20260106133831458.png)  
   
 说是提取CodeItem，其实我们提取的是CodeItem中的insns，它里面存放的是函数真正的字节码。提取insns，我们使用的是Android源码中的[dx](https://android.googlesource.com/platform/dalvik/+/refs/heads/master/dx/)工具，使用dx工具可以很方便的读取dex文件的各个部分。  
   
