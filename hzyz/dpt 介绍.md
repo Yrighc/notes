@@ -27,7 +27,6 @@ processor是可以将普通apk处理成加壳apk的模块。它的主要功能�
   
 流程如下：  
   
-![](processor.png)  
   
 shell模块最终生成的dex文件和so文件将被集成到需要加壳的apk中。它的要功能有：  
   
