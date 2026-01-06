@@ -18,6 +18,8 @@
 └── resources.arsc        # 预编译的资源索引表
 ```
 
+![](assets/Android%20APK%20包结构与加固方案解析/file-20260106140651372.png)
+
 ---
 
 ### 1. `classes.dex` - 核心代码
