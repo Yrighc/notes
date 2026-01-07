@@ -1,4 +1,4 @@
-  
+
 ## 一、项目整体架构
 
   
@@ -164,6 +164,528 @@ App 启动
 - 应用正常启动
 
 ```
+
+  
+
+---
+
+  
+
+## 2.3 DEX 处理详细流程
+
+  
+
+在编译时处理阶段，DEX 文件会经过以下 7 个关键步骤的处理：
+
+  
+
+### 步骤 1：extractDexCode - 提取 DEX 代码到资源目录
+
+  
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::extractDexCode()`
+
+  
+
+**处理过程**：
+
+```java
+
+// 1. 遍历所有 DEX 文件（classes.dex, classes2.dex...）
+
+List<File> dexFiles = getDexFiles(getDexDir(packageDir));
+
+  
+
+// 2. 如果需要保留部分类，先分割 DEX
+
+if (isKeepClasses()) {
+
+// 将 DEX 分为两部分：
+
+// - keepDex: 保留在 APK 中的类（匹配排除规则）
+
+// - splitDex: 需要保护的类（抽取代码）
+
+DexUtils.splitDex(dexFile, keepDex, splitDex);
+
+}
+
+  
+
+// 3. 提取所有方法的 CodeItem（字节码）
+
+List<Instruction> ret = DexUtils.extractAllMethods(
+
+dexFile, extractedDexFile, packageName, dumpCode, obfuscate);
+
+  
+
+// 4. 将提取的代码保存到 assets 目录
+
+// 文件：assets/classes.dex.dat（MultiDexCode 格式）
+
+MultiDexCodeUtils.writeMultiDexCode(dataOutputPath, multiDexCode);
+
+```
+
+  
+
+**目的**：
+
+- **抽取方法字节码**：将方法体替换为 return 语句或随机指令
+
+- **保存到 assets**：运行时从 assets 读取并填回
+
+- **隐藏真实代码**：APK 中不再包含原始字节码
+
+  
+
+**结果**：
+
+- 原 DEX 文件：方法体被替换（空壳）
+
+- `assets/classes.dex.dat`：包含所有 CodeItem 数据
+
+  
+
+---
+
+  
+
+### 步骤 2：addJunkCodeDex - 添加垃圾代码 DEX
+
+  
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::addJunkCodeDex()`
+
+  
+
+**处理过程**：
+
+```java
+
+// 将 junkcode.dex 添加到 DEX 目录
+
+addDex(getJunkCodeDexPath(), getDexDir(packageDir));
+
+// 例如：classes.dex, classes2.dex, junkcode.dex
+
+```
+
+  
+
+**目的**：
+
+- **反调试**：垃圾代码类包含检测逻辑
+
+- **混淆**：增加分析难度
+
+- **运行时检测**：在类加载时触发反调试检查
+
+  
+
+**结果**：
+
+- DEX 目录中新增 `junkcode.dex`（包含垃圾代码类）
+
+  
+
+---
+
+  
+
+### 步骤 3：compressDexFiles - 压缩 DEX 文件
+
+  
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::compressDexFiles()`
+
+  
+
+**处理过程**：
+
+```java
+
+// 1. 将所有 DEX 文件压缩成 ZIP（STORE 模式，不压缩）
+
+Map<String, CompressionMethod> rulesMap = new HashMap<>();
+
+rulesMap.put("classes\\d*.dex", CompressionMethod.STORE);
+
+ZipUtils.compress(getDexFiles(getDexDir(packageDir)),
+
+unalignedFilePath, rulesMap);
+
+  
+
+// 2. 执行 zipalign 对齐（优化内存映射）
+
+ZipAlign.alignZip(randomAccessFile, out);
+
+  
+
+// 3. 保存到 assets 目录
+
+// 文件：assets/classes.dex.zip
+
+```
+
+  
+
+**目的**：
+
+- **隐藏 DEX**：压缩后不易被直接提取
+
+- **对齐优化**：zipalign 提升加载性能
+
+- **统一管理**：多个 DEX 合并为一个 ZIP
+
+  
+
+**结果**：
+
+- `assets/classes.dex.zip`：包含所有 DEX 文件（压缩包）
+
+  
+
+---
+
+  
+
+### 步骤 4：deleteAllDexFiles - 删除所有 DEX 文件
+
+  
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::deleteAllDexFiles()`
+
+  
+
+**处理过程**：
+
+```java
+
+List<File> dexFiles = getDexFiles(getDexDir(packageDir));
+
+for (File dexFile : dexFiles) {
+
+dexFile.delete(); // 删除所有 .dex 文件
+
+}
+
+```
+
+  
+
+**目的**：
+
+- **清理**：删除已处理的 DEX（代码已抽取）
+
+- **防止泄露**：避免原始 DEX 残留在 APK 中
+
+- **准备合并**：为后续合并壳 DEX 做准备
+
+  
+
+**结果**：
+
+- DEX 目录清空（所有 .dex 文件已删除）
+
+  
+
+---
+
+  
+
+### 步骤 5：combineDexZipWithShellDex - 将壳 DEX 与原 DEX 合并
+
+  
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::combineDexZipWithShellDex()`
+
+  
+
+**处理过程**：
+
+```java
+
+// 1. 读取壳 DEX（ProxyApplication 等）
+
+byte[] shellDex = readFile(getProxyDexPath());
+
+  
+
+// 2. 读取压缩的 DEX ZIP
+
+byte[] zipData = readFile(originalDexZipFile); // assets/classes.dex.zip
+
+  
+
+// 3. 合并：壳 DEX + ZIP 数据 + ZIP 长度（4字节）
+
+byte[] newDexBytes = new byte[shellDexLen + zipDataLen + 4];
+
+System.arraycopy(shellDex, 0, newDexBytes, 0, shellDexLen);
+
+System.arraycopy(zipData, 0, newDexBytes, shellDexLen, zipDataLen);
+
+System.arraycopy(intToByte(zipDataLen), 0, newDexBytes, totalLen-4, 4);
+
+  
+
+// 4. 修复 DEX 头部（file_size, SHA1, CheckSum）
+
+FileUtils.fixFileSizeHeader(newDexBytes);
+
+FileUtils.fixSHA1Header(newDexBytes);
+
+FileUtils.fixCheckSumHeader(newDexBytes);
+
+  
+
+// 5. 生成新的 classes.dex
+
+writeFile(targetDexFile, newDexBytes);
+
+```
+
+  
+
+**目的**：
+
+- **隐藏 ZIP**：将 ZIP 数据嵌入 DEX 尾部
+
+- **伪装**：看起来是普通 DEX，实际包含压缩包
+
+- **运行时提取**：从 DEX 尾部读取 ZIP 长度，提取压缩包
+
+  
+
+**文件结构**：
+
+```
+
+新的 classes.dex:
+
+┌─────────────────┐
+
+│ 壳 DEX 代码 │ ProxyApplication, JniBridge 等
+
+├─────────────────┤
+
+│ ZIP 数据 │ classes.dex.zip（原 DEX 文件）
+
+├─────────────────┤
+
+│ ZIP 长度(4B) │ 用于运行时定位 ZIP 起始位置
+
+└─────────────────┘
+
+```
+
+  
+
+**运行时提取**（`shell/src/main/cpp/dpt_util.cpp`）：
+
+```cpp
+
+// shell 运行时从 DEX 文件末尾读取 ZIP 长度
+
+uint32_t zipLen = *(uint32_t*)(dexEnd - 4);
+
+uint8_t* zipData = dexBegin + (dexSize - zipLen - 4);
+
+// 解压 ZIP 得到原始 DEX 文件
+
+```
+
+  
+
+---
+
+  
+
+### 步骤 6：addKeepDexes - 添加保留 DEX 文件
+
+  
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::addKeepDexes()`
+
+  
+
+**处理过程**：
+
+```java
+
+File keepDexTempDir = getKeepDexTempDir(packageDir);
+
+File[] files = keepDexTempDir.listFiles();
+
+  
+
+// 将保留的 DEX 文件添加到 DEX 目录
+
+for (File file : files) {
+
+if (file.getName().endsWith(".dex")) {
+
+addDex(file.getAbsolutePath(), getDexDir(packageDir));
+
+}
+
+}
+
+```
+
+  
+
+**目的**：
+
+- **保留部分类**：匹配排除规则的类保留在原始 DEX 中
+
+- **兼容性**：某些类需要直接可见（如系统组件）
+
+- **性能**：减少运行时填回的工作量
+
+  
+
+**结果**：
+
+- 如果启用了 `keepClasses`，会添加 `classes2.dex`、`classes3.dex` 等保留的 DEX
+
+  
+
+---
+
+  
+
+### 步骤 7：删除临时保留 DEX 目录
+
+  
+
+**处理过程**：
+
+```java
+
+FileUtils.deleteRecurse(apk.getKeepDexTempDir(apkMainProcessPath));
+
+```
+
+  
+
+**目的**：
+
+- **清理临时文件**：删除处理过程中的临时目录
+
+  
+
+---
+
+  
+
+### DEX 处理流程总结
+
+  
+
+```
+
+原始 APK:
+
+├── classes.dex (原始代码)
+
+├── classes2.dex (原始代码)
+
+└── ...
+
+  
+
+步骤 1: extractDexCode
+
+├── classes.dex (代码已抽取，方法体为空)
+
+├── classes2.dex (代码已抽取，方法体为空)
+
+└── assets/
+
+└── classes.dex.dat (CodeItem 数据)
+
+  
+
+步骤 2: addJunkCodeDex
+
+├── classes.dex (代码已抽取)
+
+├── classes2.dex (代码已抽取)
+
+└── junkcode.dex (垃圾代码)
+
+  
+
+步骤 3: compressDexFiles
+
+├── classes.dex (代码已抽取)
+
+├── classes2.dex (代码已抽取)
+
+├── junkcode.dex (垃圾代码)
+
+└── assets/
+
+├── classes.dex.dat (CodeItem 数据)
+
+└── classes.dex.zip (压缩的 DEX 文件)
+
+  
+
+步骤 4: deleteAllDexFiles
+
+└── assets/
+
+├── classes.dex.dat (CodeItem 数据)
+
+└── classes.dex.zip (压缩的 DEX 文件)
+
+  
+
+步骤 5: combineDexZipWithShellDex
+
+├── classes.dex (壳 DEX + ZIP 数据)
+
+└── assets/
+
+├── classes.dex.dat (CodeItem 数据)
+
+└── classes.dex.zip (已删除)
+
+  
+
+步骤 6: addKeepDexes (如果启用)
+
+├── classes.dex (壳 DEX + ZIP 数据)
+
+├── classes2.dex (保留的类，如果启用 keepClasses)
+
+└── assets/
+
+└── classes.dex.dat (CodeItem 数据)
+
+```
+
+  
+
+### 为什么这样做？
+
+  
+
+1. **代码隐藏**：原始字节码不在 APK 的 DEX 中，运行时动态填回，静态分析无法直接看到
+
+2. **混淆**：方法体被替换，增加逆向难度；垃圾代码增加干扰
+
+3. **保护**：ZIP 嵌入 DEX，隐藏压缩包；运行时从内存中提取，不落盘
+
+4. **兼容性**：保留部分类，确保系统组件正常工作；支持 MultiDex
+
+5. **性能**：zipalign 对齐优化加载；按需填回，减少内存占用
 
   
 
