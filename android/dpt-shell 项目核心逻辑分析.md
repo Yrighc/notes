@@ -1,3 +1,4 @@
+  
 
 ## 一、项目整体架构
 
@@ -1255,41 +1256,417 @@ dpt_crash();
 
   
 
-**实现思路**：
-
-1. 检测 su 文件：`/system/bin/su`, `/system/xbin/su`
-
-2. 检测 root 管理应用：SuperSU, Magisk
-
-3. 检测系统属性：`ro.build.tags` 包含 `test-keys`
-
-4. 执行 su 命令测试
+#### 4.3.1 实现思路
 
   
 
-**实现代码示例**：
+ROOT 检测应该采用**多层次、多方式**的综合检测策略，参考现有的 `detectFrida()` 实现方式，在 `dpt_risk.cpp` 中实现。
+
+  
+
+**检测方式**：
+
+1. **文件系统检测**：检测 su 文件、Magisk 文件、root 管理应用
+
+2. **系统属性检测**：检测 `ro.build.tags`、`ro.debuggable` 等属性
+
+3. **环境变量检测**：检测 PATH 中的 su
+
+4. **进程检测**：检测可疑的 root 相关进程
+
+5. **SELinux 状态检测**：检测 SELinux 是否被禁用
+
+  
+
+#### 4.3.2 代码结构设计
+
+  
+
+**文件位置**：
+
+- `shell/src/main/cpp/dpt_risk.h`：添加函数声明
+
+- `shell/src/main/cpp/dpt_risk.cpp`：实现检测逻辑
+
+- `shell/src/main/cpp/dpt.cpp`：集成到 `createAntiRiskProcess()`
+
+  
+
+**函数设计**：
 
 ```cpp
 
-bool isRooted() {
+// dpt_risk.h
 
-// 1. 检测 su 文件
+void detectRoot(); // 启动 ROOT 检测
 
-if(access("/system/bin/su", F_OK) == 0) return true;
+  
 
-if(access("/system/xbin/su", F_OK) == 0) return true;
+// dpt_risk.cpp
 
-// 2. 检测 Magisk
+bool isRooted(); // 检测设备是否已 ROOT
 
-if(access("/sbin/magisk", F_OK) == 0) return true;
+void* detectRootOnThread(void* args); // 后台检测线程
 
-// 3. 检测系统属性
+```
 
-char prop[256];
+  
 
-__system_property_get("ro.build.tags", prop);
+#### 4.3.3 检测方式详解
 
-if(strstr(prop, "test-keys")) return true;
+  
+
+**方式 1：检测 su 文件路径**
+
+```cpp
+
+const char *su_paths[] = {
+
+"/system/bin/su",
+
+"/system/xbin/su",
+
+"/sbin/su",
+
+"/vendor/bin/su",
+
+"/data/local/su",
+
+"/data/local/bin/su",
+
+"/data/local/xbin/su",
+
+"/system/sbin/su",
+
+"/system/bin/failsafe/su",
+
+"/system/xbin/daemonsu",
+
+"/system/etc/init.d/99SuperSUDaemon",
+
+"/dev/com.koushikdutta.superuser.daemon/",
+
+"/system/app/Superuser.apk",
+
+"/system/app/SuperSU.apk",
+
+nullptr
+
+};
+
+  
+
+for (int i = 0; su_paths[i] != nullptr; i++) {
+
+if (access(su_paths[i], F_OK) == 0) {
+
+return true;
+
+}
+
+}
+
+```
+
+  
+
+**方式 2：检测 Magisk 相关文件**
+
+```cpp
+
+const char *magisk_paths[] = {
+
+"/sbin/magisk",
+
+"/system/bin/magisk",
+
+"/system/xbin/magisk",
+
+"/data/adb/magisk",
+
+"/cache/magisk.log",
+
+"/data/adb/magisk.db",
+
+"/data/adb/modules",
+
+nullptr
+
+};
+
+```
+
+  
+
+**方式 3：检测系统属性**
+
+```cpp
+
+char prop_value[256] = {0};
+
+  
+
+// 检测 ro.build.tags（test-keys 表示测试版本）
+
+if (__system_property_get("ro.build.tags", prop_value) > 0) {
+
+if (strstr(prop_value, "test-keys") != nullptr) {
+
+return true;
+
+}
+
+}
+
+  
+
+// 检测 ro.debuggable（调试版本，可能更容易 ROOT）
+
+prop_value[0] = '\0';
+
+if (__system_property_get("ro.debuggable", prop_value) > 0) {
+
+if (strcmp(prop_value, "1") == 0) {
+
+// 注意：仅 ro.debuggable=1 不一定表示 ROOT，可作为参考
+
+}
+
+}
+
+  
+
+// 检测 ro.secure（安全模式）
+
+prop_value[0] = '\0';
+
+if (__system_property_get("ro.secure", prop_value) > 0) {
+
+if (strcmp(prop_value, "0") == 0) {
+
+return true; // ro.secure=0 通常表示已 ROOT
+
+}
+
+}
+
+```
+
+  
+
+**方式 4：检测 root 管理应用数据目录**
+
+```cpp
+
+const char *root_app_paths[] = {
+
+"/data/data/com.noshufou.android.su",
+
+"/data/data/com.thirdparty.superuser",
+
+"/data/data/eu.chainfire.supersu",
+
+"/data/data/com.topjohnwu.magisk",
+
+"/data/data/com.kingroot.kinguser",
+
+"/data/data/com.kingo.root",
+
+"/data/data/com.smedialink.oneclickroot",
+
+"/data/data/com.zhiqupk.root.global",
+
+"/data/data/com.alephzain.framaroot",
+
+"/data/data/com.devadvance.rootcloak",
+
+"/data/data/com.devadvance.rootcloakplus",
+
+nullptr
+
+};
+
+```
+
+  
+
+**方式 5：检测 PATH 环境变量中的 su**
+
+```cpp
+
+FILE *fp = popen("which su", "r");
+
+if (fp != nullptr) {
+
+char result[256] = {0};
+
+if (fgets(result, sizeof(result), fp) != nullptr) {
+
+if (strlen(result) > 0 && result[0] != '\n') {
+
+pclose(fp);
+
+return true;
+
+}
+
+}
+
+pclose(fp);
+
+}
+
+```
+
+  
+
+**方式 6：检测 SELinux 状态**
+
+```cpp
+
+// 读取 /proc/filesystems 或检查 SELinux 状态
+
+FILE *fp = fopen("/proc/filesystems", "r");
+
+if (fp != nullptr) {
+
+char line[256];
+
+while (fgets(line, sizeof(line), fp)) {
+
+// 检查 SELinux 相关文件系统
+
+}
+
+fclose(fp);
+
+}
+
+  
+
+// 或者通过 getenforce 命令检测
+
+FILE *fp = popen("getenforce", "r");
+
+if (fp != nullptr) {
+
+char result[16] = {0};
+
+if (fgets(result, sizeof(result), fp) != nullptr) {
+
+if (strstr(result, "Disabled") != nullptr) {
+
+pclose(fp);
+
+return true; // SELinux 被禁用，可能已 ROOT
+
+}
+
+}
+
+pclose(fp);
+
+}
+
+```
+
+  
+
+**方式 7：检测 /proc 文件系统中的可疑进程**
+
+```cpp
+
+// 读取 /proc 目录，检测可疑的 root 相关进程
+
+DIR *dir = opendir("/proc");
+
+if (dir != nullptr) {
+
+struct dirent *entry;
+
+while ((entry = readdir(dir)) != nullptr) {
+
+if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
+
+char cmdline_path[256];
+
+snprintf(cmdline_path, sizeof(cmdline_path),
+
+"/proc/%s/cmdline", entry->d_name);
+
+FILE *fp = fopen(cmdline_path, "r");
+
+if (fp != nullptr) {
+
+char cmdline[256] = {0};
+
+fgets(cmdline, sizeof(cmdline), fp);
+
+fclose(fp);
+
+// 检测可疑进程名
+
+if (strstr(cmdline, "su") != nullptr ||
+
+strstr(cmdline, "magisk") != nullptr ||
+
+strstr(cmdline, "superuser") != nullptr) {
+
+closedir(dir);
+
+return true;
+
+}
+
+}
+
+}
+
+}
+
+closedir(dir);
+
+}
+
+```
+
+  
+
+#### 4.3.4 实现代码结构
+
+  
+
+**核心检测函数**：
+
+```cpp
+
+/**
+
+* 检测设备是否已 ROOT
+
+* 综合多种检测方式，提高准确性
+
+* @return true 如果检测到 ROOT，false 否则
+
+*/
+
+DPT_ENCRYPT bool isRooted() {
+
+// 方式 1：检测 su 文件路径
+
+// 方式 2：检测 Magisk 相关文件
+
+// 方式 3：检测系统属性
+
+// 方式 4：检测 root 管理应用数据目录
+
+// 方式 5：检测 PATH 环境变量中的 su
+
+// 方式 6：检测 SELinux 状态
+
+// 方式 7：检测 /proc 文件系统中的可疑进程
+
+// 如果任一方式检测到 ROOT，返回 true
 
 return false;
 
@@ -1299,9 +1676,349 @@ return false;
 
   
 
-**参考资料**：
+**后台检测线程**：
 
-- RootBeer：https://github.com/scottyab/rootbeer
+```cpp
+
+/**
+
+* ROOT 检测线程（持续运行）
+
+* 定期检测设备 ROOT 状态
+
+*/
+
+[[noreturn]] DPT_ENCRYPT void *detectRootOnThread(__unused void *args) {
+
+while (true) {
+
+if (isRooted()) {
+
+DLOGD("detected root, crashing...");
+
+dpt_crash();
+
+}
+
+sleep(10); // 每 10 秒检测一次
+
+}
+
+}
+
+```
+
+  
+
+**启动检测函数**：
+
+```cpp
+
+/**
+
+* 启动 ROOT 检测
+
+* 1. 立即检测一次
+
+* 2. 启动后台检测线程
+
+*/
+
+DPT_ENCRYPT void detectRoot() {
+
+// 立即检测一次
+
+if (isRooted()) {
+
+DLOGD("detected root immediately, crashing...");
+
+dpt_crash();
+
+}
+
+// 启动后台检测线程
+
+pthread_t t;
+
+pthread_create(&t, nullptr, detectRootOnThread, nullptr);
+
+}
+
+```
+
+  
+
+#### 4.3.5 集成位置
+
+  
+
+**集成到 `createAntiRiskProcess()`**：
+
+```cpp
+
+// dpt.cpp::createAntiRiskProcess()
+
+DPT_ENCRYPT void createAntiRiskProcess() {
+
+// 首先检测 ROOT（在主进程和子进程都要检测）
+
+detectRoot();
+
+pid_t child = fork();
+
+if(child < 0) {
+
+// fork 失败
+
+DLOGW("fork fail!");
+
+detectFrida();
+
+detectRoot(); // 添加 ROOT 检测
+
+}
+
+else if(child == 0) {
+
+// 子进程：检测 Frida、ROOT 和 ptrace
+
+DLOGD("in child process");
+
+detectFrida();
+
+detectRoot(); // 添加 ROOT 检测
+
+doPtrace();
+
+}
+
+else {
+
+// 主进程：监控子进程 + 检测 Frida 和 ROOT
+
+DLOGD("in main process, child pid: %d", child);
+
+protectChildProcess(child);
+
+detectFrida();
+
+detectRoot(); // 添加 ROOT 检测
+
+}
+
+}
+
+```
+
+  
+
+#### 4.3.6 执行流程
+
+  
+
+```
+
+应用启动
+
+↓
+
+init_dpt() (SO 加载时，.init_array)
+
+↓
+
+createAntiRiskProcess()
+
+↓
+
+detectRoot() (立即检测一次)
+
+├─→ isRooted() 综合检测
+
+│ ├─→ 检测 su 文件路径
+
+│ ├─→ 检测 Magisk 文件
+
+│ ├─→ 检测系统属性
+
+│ ├─→ 检测 root 管理应用
+
+│ ├─→ 检测 PATH 中的 su
+
+│ ├─→ 检测 SELinux 状态
+
+│ └─→ 检测可疑进程
+
+│
+
+└─→ 如果检测到 ROOT → dpt_crash()
+
+│
+
+└─→ 启动 detectRootOnThread() 后台线程
+
+└─→ 每 10 秒检测一次
+
+└─→ 如果检测到 ROOT → dpt_crash()
+
+```
+
+  
+
+#### 4.3.7 字符串混淆
+
+  
+
+**使用 AY_OBFUSCATE 宏**：
+
+所有检测路径都应该使用 `AY_OBFUSCATE()` 宏进行字符串混淆，防止静态分析：
+
+  
+
+```cpp
+
+const char *su_path = AY_OBFUSCATE("/system/bin/su");
+
+const char *magisk_path = AY_OBFUSCATE("/sbin/magisk");
+
+const char *prop_name = AY_OBFUSCATE("ro.build.tags");
+
+```
+
+  
+
+#### 4.3.8 注意事项
+
+  
+
+1. **误报风险**：
+
+- `ro.debuggable=1` 不一定表示 ROOT（可能是开发版本）
+
+- `ro.build.tags=test-keys` 可能是官方测试版本
+
+- 建议综合多种检测方式，避免单一检测的误报
+
+  
+
+2. **绕过可能**：
+
+- Magisk Hide 可能会隐藏 ROOT 痕迹
+
+- 某些高级 ROOT 工具可能会 Hook 系统调用
+
+- 建议结合其他检测方式（如 Frida 检测）
+
+  
+
+3. **性能影响**：
+
+- 文件系统检测（access）性能开销很小
+
+- 系统属性检测性能开销很小
+
+- `/proc` 目录遍历可能有一定开销，建议限制检测频率
+
+- 后台线程每 10 秒检测一次，对性能影响很小
+
+  
+
+4. **兼容性**：
+
+- `popen()` 在某些 Android 版本可能不可用，需要添加错误处理
+
+- `/proc` 目录访问需要权限，可能在某些设备上失败
+
+- 建议添加异常处理，避免检测失败导致应用崩溃
+
+  
+
+5. **检测时机**：
+
+- 应用启动时立即检测一次
+
+- 后台线程持续检测（每 10 秒）
+
+- 主进程和子进程都要检测，提高可靠性
+
+  
+
+6. **日志输出**：
+
+- 使用 `DLOGD()` 输出调试日志
+
+- 检测到 ROOT 时输出警告日志
+
+- 避免输出敏感信息（如检测路径）
+
+  
+
+#### 4.3.9 头文件依赖
+
+  
+
+**需要在 `dpt_risk.h` 中添加**：
+
+```cpp
+
+#include <sys/system_properties.h> // 系统属性检测
+
+#include <fcntl.h> // access() 函数
+
+#include <stdio.h> // popen(), fgets()
+
+#include <dirent.h> // /proc 目录遍历
+
+```
+
+  
+
+#### 4.3.10 测试建议
+
+  
+
+1. **正常设备测试**：
+
+- 在未 ROOT 的设备上运行，应用应正常启动
+
+- 检查 logcat，确认没有误报
+
+  
+
+2. **ROOT 设备测试**：
+
+- 在已 ROOT 的设备上运行，应用应立即崩溃
+
+- 测试不同的 ROOT 工具（SuperSU、Magisk、KingRoot 等）
+
+  
+
+3. **绕过测试**：
+
+- 测试 Magisk Hide 是否能绕过检测
+
+- 测试删除 su 文件后是否能绕过检测
+
+  
+
+4. **性能测试**：
+
+- 监控检测线程的 CPU 占用
+
+- 确认检测不影响应用正常使用
+
+  
+
+#### 4.3.11 参考资源
+
+  
+
+- **RootBeer**：https://github.com/scottyab/rootbeer
+
+- **Android 系统属性**：https://source.android.com/devices/tech/config
+
+- **Magisk 文档**：https://topjohnwu.github.io/Magisk/
+
+- **SELinux 文档**：https://source.android.com/security/selinux
 
   
 
