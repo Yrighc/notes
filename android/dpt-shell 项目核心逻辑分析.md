@@ -1264,17 +1264,31 @@ ROOT 检测应该采用**多层次、多方式**的综合检测策略，参考�
 
   
 
-**检测方式**：
+**检测方式**（共 13 种，当前 10 种已启用，3 种已禁用）：
 
-1. **文件系统检测**：检测 su 文件、Magisk 文件、root 管理应用
+1. **文件系统检测** ✅：检测 su 文件、Magisk 文件、root 管理应用、KernelSU 文件
 
-2. **系统属性检测**：检测 `ro.build.tags`、`ro.debuggable` 等属性
+2. **系统属性检测** ✅：检测 `ro.build.tags`、`ro.secure` 等属性
 
-3. **环境变量检测**：检测 PATH 中的 su
+3. **环境变量检测** ✅：检测 PATH 中的 su
 
-4. **进程检测**：检测可疑的 root 相关进程
+4. **SELinux 状态检测** ✅：检测 SELinux 是否被禁用
 
-5. **SELinux 状态检测**：检测 SELinux 是否被禁用
+5. **KernelSU 专项检测**：检测内核级 ROOT 方案（KernelSU）
+
+- 检测 KernelSU 文件路径 ✅
+
+- 检测进程 UID（/proc/self/status）✅
+
+- 检测系统分区挂载状态（/proc/mounts）❌ **已禁用（容易误报）**
+
+- 检测内核符号表（/proc/kallsyms）❌ **已禁用（容易误报）**
+
+- 检测内核模块（/proc/modules）✅ **已优化**
+
+- 检测 SELinux 状态文件（/sys/fs/selinux/status）✅
+
+- 尝试执行 su 命令 ❌ **已禁用（可能阻塞）**
 
   
 
@@ -1454,7 +1468,7 @@ return true; // ro.secure=0 通常表示已 ROOT
 
   
 
-**方式 4：检测 root 管理应用数据目录**
+**方式 4：检测 root 管理应用数据目录（包括 KernelSU）**
 
 ```cpp
 
@@ -1481,6 +1495,14 @@ const char *root_app_paths[] = {
 "/data/data/com.devadvance.rootcloak",
 
 "/data/data/com.devadvance.rootcloakplus",
+
+// KernelSU 相关应用
+
+"/data/data/com.omarea.vtools", // KernelSU Manager
+
+"/data/data/me.weishu.kernelsu",
+
+"/data/data/com.kernelsu.manager",
 
 nullptr
 
@@ -1524,27 +1546,7 @@ pclose(fp);
 
 ```cpp
 
-// 读取 /proc/filesystems 或检查 SELinux 状态
-
-FILE *fp = fopen("/proc/filesystems", "r");
-
-if (fp != nullptr) {
-
-char line[256];
-
-while (fgets(line, sizeof(line), fp)) {
-
-// 检查 SELinux 相关文件系统
-
-}
-
-fclose(fp);
-
-}
-
-  
-
-// 或者通过 getenforce 命令检测
+// 通过 getenforce 命令检测
 
 FILE *fp = popen("getenforce", "r");
 
@@ -1572,47 +1574,133 @@ pclose(fp);
 
   
 
-**方式 7：检测 /proc 文件系统中的可疑进程**
+**方式 7：检测 KernelSU 相关文件路径**
 
 ```cpp
 
-// 读取 /proc 目录，检测可疑的 root 相关进程
+// KernelSU 是内核级 ROOT 方案，会在特定路径留下痕迹
 
-DIR *dir = opendir("/proc");
+const char *kernelsu_paths[] = {
 
-if (dir != nullptr) {
+"/data/adb/ksu",
 
-struct dirent *entry;
+"/data/adb/modules/ksu",
 
-while ((entry = readdir(dir)) != nullptr) {
+"/data/adb/ksud",
 
-if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
+"/dev/kernelsu",
 
-char cmdline_path[256];
+"/sys/fs/kernelsu",
 
-snprintf(cmdline_path, sizeof(cmdline_path),
+"/proc/sys/kernel/kernelsu",
 
-"/proc/%s/cmdline", entry->d_name);
+nullptr
 
-FILE *fp = fopen(cmdline_path, "r");
+};
+
+  
+
+for (int i = 0; kernelsu_paths[i] != nullptr; i++) {
+
+if (access(kernelsu_paths[i], F_OK) == 0) {
+
+return true;
+
+}
+
+}
+
+```
+
+  
+
+**方式 8：检测 /proc/self/status 中的 UID（KernelSU 可能通过内核修改 UID）**
+
+```cpp
+
+// 读取当前进程的状态信息
+
+FILE *fp = fopen("/proc/self/status", "r");
 
 if (fp != nullptr) {
 
-char cmdline[256] = {0};
+char line[256] = {0};
 
-fgets(cmdline, sizeof(cmdline), fp);
+while (fgets(line, sizeof(line), fp) != nullptr) {
+
+// 查找 Uid 行：Uid: 1000 1000 1000 1000
+
+// 如果第一个 UID 为 0，说明当前进程有 root 权限
+
+if (strncmp(line, "Uid:", 4) == 0) {
+
+unsigned int uid = 0;
+
+if (sscanf(line + 4, "%u", &uid) == 1) {
+
+if (uid == 0) {
 
 fclose(fp);
 
-// 检测可疑进程名
+return true; // 检测到 root UID
 
-if (strstr(cmdline, "su") != nullptr ||
+}
 
-strstr(cmdline, "magisk") != nullptr ||
+}
 
-strstr(cmdline, "superuser") != nullptr) {
+}
 
-closedir(dir);
+}
+
+fclose(fp);
+
+}
+
+```
+
+  
+
+**方式 9：检测 /proc/mounts 中系统分区是否被重新挂载为可读写**
+
+```cpp
+
+// KernelSU 可能修改系统分区挂载状态
+
+FILE *fp = fopen("/proc/mounts", "r");
+
+if (fp != nullptr) {
+
+char line[512] = {0};
+
+while (fgets(line, sizeof(line), fp) != nullptr) {
+
+// 检查 /system 分区是否被重新挂载为可读写
+
+// 正常情况下 /system 应该是 ro（只读），如果看到 rw（读写）可能是 ROOT
+
+if (strstr(line, "/system") != nullptr) {
+
+if (strstr(line, " rw,") != nullptr ||
+
+strstr(line, " rw ") != nullptr) {
+
+fclose(fp);
+
+return true;
+
+}
+
+}
+
+// 检查 /vendor 分区
+
+if (strstr(line, "/vendor") != nullptr) {
+
+if (strstr(line, " rw,") != nullptr ||
+
+strstr(line, " rw ") != nullptr) {
+
+fclose(fp);
 
 return true;
 
@@ -1622,9 +1710,7 @@ return true;
 
 }
 
-}
-
-closedir(dir);
+fclose(fp);
 
 }
 
@@ -1632,7 +1718,221 @@ closedir(dir);
 
   
 
-#### 4.3.4 实现代码结构
+**方式 10：检测 /proc/kallsyms 是否可读且包含有效内容**
+
+```cpp
+
+// 正常情况下普通应用无法读取内核符号表
+
+// 如果能读取有效的内核符号，可能是 ROOT（KernelSU 可能允许读取）
+
+FILE *fp = fopen("/proc/kallsyms", "r");
+
+if (fp != nullptr) {
+
+char line[256] = {0};
+
+int valid_lines = 0;
+
+// 读取前几行，检查是否包含有效的内核符号
+
+for (int i = 0; i < 5 && fgets(line, sizeof(line), fp) != nullptr; i++) {
+
+// 检查是否包含有效的内核符号格式（地址 + 类型 + 符号名）
+
+if (strlen(line) > 20) {
+
+if ((line[0] >= '0' && line[0] <= '9') ||
+
+(line[0] >= 'a' && line[0] <= 'f')) {
+
+// 检查是否包含符号名（通常在地址和类型之后）
+
+for (int j = 0; j < (int)strlen(line) - 1; j++) {
+
+if (line[j] == ' ' && line[j+1] != ' ' && line[j+1] != '\n') {
+
+valid_lines++;
+
+break;
+
+}
+
+}
+
+}
+
+}
+
+}
+
+fclose(fp);
+
+// 如果能读取到有效的内核符号，可能是 ROOT
+
+if (valid_lines >= 2) {
+
+return true;
+
+}
+
+}
+
+```
+
+  
+
+**方式 11：检测 /proc/modules 中是否有 KernelSU 相关的内核模块**
+
+```cpp
+
+// KernelSU 通过内核模块实现，会在 /proc/modules 中显示
+
+FILE *fp = fopen("/proc/modules", "r");
+
+if (fp != nullptr) {
+
+char line[512] = {0};
+
+while (fgets(line, sizeof(line), fp) != nullptr) {
+
+// 检查是否有 KernelSU 相关的模块
+
+if (strstr(line, "kernelsu") != nullptr ||
+
+strstr(line, "ksu") != nullptr) {
+
+fclose(fp);
+
+return true;
+
+}
+
+}
+
+fclose(fp);
+
+}
+
+```
+
+  
+
+**方式 12：检测 /sys/fs/selinux/status（KernelSU 可能修改 SELinux 状态）**
+
+```cpp
+
+// 读取 SELinux 状态文件
+
+FILE *fp = fopen("/sys/fs/selinux/status", "r");
+
+if (fp != nullptr) {
+
+char status[16] = {0};
+
+if (fgets(status, sizeof(status), fp) != nullptr) {
+
+// 移除换行符
+
+size_t len = strlen(status);
+
+if (len > 0 && status[len - 1] == '\n') {
+
+status[len - 1] = '\0';
+
+}
+
+// 如果 SELinux 状态为 disabled，可能是 ROOT
+
+if (strcmp(status, "disabled") == 0) {
+
+fclose(fp);
+
+return true;
+
+}
+
+}
+
+fclose(fp);
+
+}
+
+```
+
+  
+
+**方式 13：尝试执行 su 命令检测（KernelSU 可能提供 su 命令）**
+
+```cpp
+
+// 使用 timeout 避免阻塞，如果 su 不存在或需要用户确认，timeout 会快速返回
+
+FILE *fp = popen("timeout 1 su -c 'id' 2>/dev/null", "r");
+
+if (fp != nullptr) {
+
+char result[256] = {0};
+
+if (fgets(result, sizeof(result), fp) != nullptr) {
+
+// 如果返回了 uid=0，说明有 root 权限
+
+if (strstr(result, "uid=0") != nullptr) {
+
+pclose(fp);
+
+return true;
+
+}
+
+}
+
+pclose(fp);
+
+}
+
+```
+
+  
+
+#### 4.3.4 已实现的检测功能清单
+
+  
+
+**当前实现状态**（共 13 种检测方式，其中 10 种已启用，3 种已禁用）：
+
+  
+
+| 方式 | 检测内容 | 状态 | 说明 |
+
+|------|---------|------|------|
+
+| 方式 1 | 检测 su 文件路径（15 个常见路径） | ✅ 已启用 | 检测传统 ROOT 工具的 su 文件 |
+
+| 方式 2 | 检测 Magisk 相关文件（7 个路径） | ✅ 已启用 | 检测 Magisk ROOT 方案 |
+
+| 方式 3 | 检测系统属性（ro.build.tags, ro.secure） | ✅ 已启用 | 检测系统属性异常 |
+
+| 方式 4 | 检测 root 管理应用数据目录（包括 KernelSU 应用） | ✅ 已启用 | 检测已安装的 ROOT 管理应用 |
+
+| 方式 5 | 检测 PATH 环境变量中的 su | ✅ 已启用 | 检测 PATH 中的 su 命令 |
+
+| 方式 6 | 检测 SELinux 状态（getenforce） | ✅ 已启用 | 检测 SELinux 是否被禁用 |
+
+| 方式 7 | 检测 KernelSU 相关文件路径（7 个路径） | ✅ 已启用 | 检测 KernelSU 特有文件 |
+
+| 方式 8 | 检测进程 UID（/proc/self/status） | ✅ 已启用 | 检测当前进程是否有 root UID |
+
+| 方式 9 | 检测系统分区挂载状态（/proc/mounts） | ❌ **已禁用** | **容易误报，已禁用** |
+
+| 方式 10 | 检测内核符号表（/proc/kallsyms） | ❌ **已禁用** | **容易误报，已禁用** |
+
+| 方式 11 | 检测内核模块（/proc/modules） | ✅ 已启用 | 检测 KernelSU 内核模块（已优化） |
+
+| 方式 12 | 检测 SELinux 状态文件（/sys/fs/selinux/status） | ✅ 已启用 | 检测 SELinux 状态文件 |
+
+| 方式 13 | 尝试执行 su 命令 | ❌ **已禁用** | **可能阻塞，已禁用** |
 
   
 
@@ -1652,19 +1952,31 @@ closedir(dir);
 
 DPT_ENCRYPT bool isRooted() {
 
-// 方式 1：检测 su 文件路径
+// 方式 1：检测 su 文件路径（15 个常见路径）✅
 
-// 方式 2：检测 Magisk 相关文件
+// 方式 2：检测 Magisk 相关文件（7 个路径）✅
 
-// 方式 3：检测系统属性
+// 方式 3：检测系统属性（ro.build.tags, ro.secure）✅
 
-// 方式 4：检测 root 管理应用数据目录
+// 方式 4：检测 root 管理应用数据目录（包括 KernelSU 应用）✅
 
-// 方式 5：检测 PATH 环境变量中的 su
+// 方式 5：检测 PATH 环境变量中的 su ✅
 
-// 方式 6：检测 SELinux 状态
+// 方式 6：检测 SELinux 状态（getenforce）✅
 
-// 方式 7：检测 /proc 文件系统中的可疑进程
+// 方式 7：检测 KernelSU 相关文件路径（7 个路径）✅
+
+// 方式 8：检测 /proc/self/status 中的 UID ✅
+
+// 方式 9：检测 /proc/mounts 中系统分区挂载状态 ❌ 已禁用（容易误报）
+
+// 方式 10：检测 /proc/kallsyms 可读性 ❌ 已禁用（容易误报）
+
+// 方式 11：检测 /proc/modules 中的内核模块 ✅（已优化）
+
+// 方式 12：检测 /sys/fs/selinux/status ✅
+
+// 方式 13：尝试执行 su 命令 ❌ 已禁用（可能阻塞）
 
 // 如果任一方式检测到 ROOT，返回 true
 
@@ -1832,21 +2144,33 @@ createAntiRiskProcess()
 
 detectRoot() (立即检测一次)
 
-├─→ isRooted() 综合检测
+├─→ isRooted() 综合检测（10 种已启用的检测方式）
 
-│ ├─→ 检测 su 文件路径
+│ ├─→ 方式 1：检测 su 文件路径（15 个路径）✅
 
-│ ├─→ 检测 Magisk 文件
+│ ├─→ 方式 2：检测 Magisk 文件（7 个路径）✅
 
-│ ├─→ 检测系统属性
+│ ├─→ 方式 3：检测系统属性（ro.build.tags, ro.secure）✅
 
-│ ├─→ 检测 root 管理应用
+│ ├─→ 方式 4：检测 root 管理应用（包括 KernelSU 应用）✅
 
-│ ├─→ 检测 PATH 中的 su
+│ ├─→ 方式 5：检测 PATH 中的 su ✅
 
-│ ├─→ 检测 SELinux 状态
+│ ├─→ 方式 6：检测 SELinux 状态 ✅
 
-│ └─→ 检测可疑进程
+│ ├─→ 方式 7：检测 KernelSU 文件路径（7 个路径）✅
+
+│ ├─→ 方式 8：检测进程 UID（/proc/self/status）✅
+
+│ ├─→ 方式 9：检测系统分区挂载状态 ❌ 已禁用
+
+│ ├─→ 方式 10：检测内核符号表 ❌ 已禁用
+
+│ ├─→ 方式 11：检测内核模块（/proc/modules）✅
+
+│ ├─→ 方式 12：检测 SELinux 状态文件（/sys/fs/selinux/status）✅
+
+│ └─→ 方式 13：尝试执行 su 命令 ❌ 已禁用
 
 │
 
@@ -1886,7 +2210,127 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
   
 
-#### 4.3.8 注意事项
+#### 4.3.8 KernelSU 检测说明
+
+  
+
+**KernelSU 的特殊性**：
+
+- KernelSU 是**内核级 ROOT 方案**，通过修改内核实现 ROOT 权限
+
+- 相比传统的用户空间 ROOT 方案（如 SuperSU、Magisk），KernelSU 更难检测
+
+- KernelSU 可能不会在常见路径留下 su 文件，也不会修改系统属性
+
+- 因此需要采用**更深层次的检测方式**（方式 7-13）
+
+  
+
+**针对 KernelSU 的检测策略**（当前实现状态）：
+
+1. **文件路径检测**（方式 7）✅：检测 KernelSU 特有的文件路径（7 个路径）
+
+2. **进程 UID 检测**（方式 8）✅：KernelSU 可能通过内核修改进程 UID
+
+3. **挂载点检测**（方式 9）❌：检测系统分区是否被重新挂载为可读写（**已禁用，容易误报**）
+
+4. **内核符号表检测**（方式 10）❌：检测是否能读取有效的内核符号（**已禁用，容易误报**）
+
+5. **内核模块检测**（方式 11）✅：检测是否有 KernelSU 相关的内核模块（**已优化**）
+
+6. **SELinux 状态检测**（方式 12）✅：检测 SELinux 是否被禁用
+
+7. **su 命令检测**（方式 13）❌：尝试执行 su 命令验证是否有 ROOT 权限（**已禁用，可能阻塞**）
+
+  
+
+**检测效果**：
+
+- 通过综合使用当前已启用的 10 种检测方式，可以有效检测到 KernelSU
+
+- 即使 KernelSU 隐藏了部分痕迹，其他检测方式仍可能发现 ROOT 状态
+
+- 已禁用的检测方式（方式 9、10、13）虽然可能提高检测率，但容易误报，因此已禁用
+
+- 建议定期更新检测方式，以应对 KernelSU 的更新
+
+  
+
+#### 4.3.9 误报风险与已禁用检测方式说明
+
+  
+
+**可能导致误报的检测方式（已禁用）**：
+
+  
+
+1. **方式 9：检测系统分区挂载状态（/proc/mounts）** ❌ **已禁用**
+
+- **误报原因**：
+
+- 某些正常设备上，系统分区可能被挂载为 `rw`（可读写），这不一定是 ROOT 的标志
+
+- 某些厂商 ROM 或开发版本可能允许系统分区可写
+
+- 检测逻辑过于严格，容易误判正常设备为 ROOT
+
+- **禁用状态**：代码中已注释，不会执行此检测
+
+- **影响**：可能无法检测到通过重新挂载系统分区实现的 ROOT，但避免了误报
+
+  
+
+2. **方式 10：检测内核符号表（/proc/kallsyms）** ❌ **已禁用**
+
+- **误报原因**：
+
+- 某些设备即使没有 ROOT，也可能允许读取 `/proc/kallsyms`
+
+- 虽然内容可能是全 0，但检测逻辑可能不够严格，导致误报
+
+- 不同设备的内核符号表格式可能不同，检测逻辑难以适配所有设备
+
+- **禁用状态**：代码中已注释，不会执行此检测
+
+- **影响**：可能无法检测到通过内核符号表暴露的 ROOT，但避免了误报
+
+  
+
+3. **方式 13：尝试执行 su 命令** ❌ **已禁用**
+
+- **误报/阻塞原因**：
+
+- `timeout` 命令在某些 Android 设备上可能不存在，导致命令执行失败
+
+- 即使使用 `timeout`，在某些设备上仍可能阻塞
+
+- 如果设备有 su 但需要用户确认，可能导致应用启动时阻塞
+
+- **禁用状态**：代码中已注释，不会执行此检测
+
+- **影响**：可能无法检测到通过 su 命令实现的 ROOT，但避免了阻塞和兼容性问题
+
+  
+
+**已优化检测方式**：
+
+  
+
+1. **方式 11：检测内核模块（/proc/modules）** ✅ **已优化**
+
+- **优化内容**：
+
+- 更精确地匹配 "kernelsu" 模块名
+
+- 检查独立的 "ksu" 模块时，确保它是模块名的一部分，而不是其他字符串的一部分
+
+- 避免误报（如其他模块名包含 "ksu" 字符串）
+
+- **状态**：已启用，检测逻辑已优化
+
+  
+
+#### 4.3.10 注意事项
 
   
 
@@ -1896,7 +2340,9 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - `ro.build.tags=test-keys` 可能是官方测试版本
 
-- 建议综合多种检测方式，避免单一检测的误报
+- 已禁用的检测方式（方式 9、10、13）容易误报，因此已禁用
+
+- 建议综合多种检测方式（当前 10 种已启用），避免单一检测的误报
 
   
 
@@ -1904,7 +2350,11 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - Magisk Hide 可能会隐藏 ROOT 痕迹
 
+- KernelSU 作为内核级 ROOT 方案，可能更难检测
+
 - 某些高级 ROOT 工具可能会 Hook 系统调用
+
+- 建议结合多种检测方式（当前 10 种已启用），提高检测准确性
 
 - 建议结合其他检测方式（如 Frida 检测）
 
@@ -1916,7 +2366,7 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - 系统属性检测性能开销很小
 
-- `/proc` 目录遍历可能有一定开销，建议限制检测频率
+- `/proc` 目录访问性能开销很小
 
 - 后台线程每 10 秒检测一次，对性能影响很小
 
@@ -1924,11 +2374,11 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 4. **兼容性**：
 
-- `popen()` 在某些 Android 版本可能不可用，需要添加错误处理
+- `popen()` 在某些 Android 版本可能不可用，已添加错误处理
 
-- `/proc` 目录访问需要权限，可能在某些设备上失败
+- `/proc` 目录访问需要权限，可能在某些设备上失败，已添加错误处理
 
-- 建议添加异常处理，避免检测失败导致应用崩溃
+- 所有文件操作都有错误检查，避免检测失败导致应用崩溃
 
   
 
@@ -1946,13 +2396,23 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - 使用 `DLOGD()` 输出调试日志
 
-- 检测到 ROOT 时输出警告日志
+- 检测到 ROOT 时输出警告日志（`DLOGW()`）
 
-- 避免输出敏感信息（如检测路径）
+- 避免输出敏感信息（如检测路径，已使用字符串混淆）
 
   
 
-#### 4.3.9 头文件依赖
+7. **检测方式启用/禁用**：
+
+- 当前共实现 13 种检测方式，其中 10 种已启用，3 种已禁用
+
+- 已禁用的检测方式在代码中已注释，不会执行
+
+- 如需启用已禁用的检测方式，需要在实际设备上充分测试，避免误报
+
+  
+
+#### 4.3.11 头文件依赖
 
   
 
@@ -1972,7 +2432,7 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
   
 
-#### 4.3.10 测试建议
+#### 4.3.12 测试建议
 
   
 
@@ -1988,7 +2448,23 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - 在已 ROOT 的设备上运行，应用应立即崩溃
 
-- 测试不同的 ROOT 工具（SuperSU、Magisk、KingRoot 等）
+- 测试不同的 ROOT 工具（SuperSU、Magisk、KingRoot、KernelSU 等）
+
+- **重点测试 KernelSU**：KernelSU 是内核级 ROOT 方案，需要验证当前已启用的 10 种检测方式是否有效
+
+- 测试已禁用的检测方式（方式 9、10、13）在实际设备上的表现，评估是否可以重新启用
+
+  
+
+3. **误报测试**：
+
+- 在正常设备上运行，应用应正常启动
+
+- 测试不同厂商的 ROM（MIUI、ColorOS、OneUI 等）
+
+- 测试开发版本和测试版本，确认不会误报
+
+- 如果发现误报，需要进一步优化检测逻辑或禁用相关检测方式
 
   
 
@@ -2008,7 +2484,7 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
   
 
-#### 4.3.11 参考资源
+#### 4.3.13 参考资源
 
   
 
@@ -2018,7 +2494,13 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - **Magisk 文档**：https://topjohnwu.github.io/Magisk/
 
+- **KernelSU 文档**：https://kernelsu.org/
+
+- **KernelSU GitHub**：https://github.com/tiann/KernelSU
+
 - **SELinux 文档**：https://source.android.com/security/selinux
+
+- **Android Root 检测最佳实践**：https://github.com/scottyab/rootbeer/blob/master/README.md
 
   
 
@@ -2404,7 +2886,6 @@ WindowManager.LayoutParams.FLAG_SECURE
 
 - Android 数据加密：https://developer.android.com/training/articles/keystore
 
-### 4.14 代理检测
   
 
 ---
