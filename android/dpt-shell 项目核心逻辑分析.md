@@ -1,3 +1,4 @@
+
   
 
 ## 一、项目整体架构
@@ -1252,7 +1253,7 @@ dpt_crash();
 
   
 
-### 4.3 ROOT 检测
+### 4.3 ROOT 检测 【已完成】
 
   
 
@@ -2006,9 +2007,13 @@ while (true) {
 
 if (isRooted()) {
 
-DLOGD("detected root, crashing...");
+// 1) 置位 ROOT 检测标志（供 Java 层查询并弹窗告警）
 
-dpt_crash();
+// 2) 启动延迟退出（避免“秒崩无提示”）
+
+mark_root_detected();
+
+schedule_root_delayed_crash_once();
 
 }
 
@@ -2042,9 +2047,15 @@ DPT_ENCRYPT void detectRoot() {
 
 if (isRooted()) {
 
-DLOGD("detected root immediately, crashing...");
+// 1) 置位 ROOT 检测标志（供 Java 层查询并弹窗告警）
 
-dpt_crash();
+// 2) 启动延迟退出（避免“秒崩无提示”）
+
+mark_root_detected();
+
+schedule_root_delayed_crash_once();
+
+return;
 
 }
 
@@ -2057,6 +2068,34 @@ pthread_create(&t, nullptr, detectRootOnThread, nullptr);
 }
 
 ```
+
+  
+
+**Java 层查询接口（JNI）**：
+
+```cpp
+
+// native: dpt_risk.cpp
+
+bool isRootDetected();
+
+  
+
+// JNI: dpt.cpp 注册
+
+// "isRootDetected", "()Z"
+
+```
+
+  
+
+**Java 层弹窗入口**（推荐放在 `ProxyComponentFactory`，因为能拿到稳定的 Activity WindowToken）：
+
+- `instantiateApplication()` 启动主线程 watcher（短轮询），等待 `JniBridge.isRootDetected()` 变为 true
+
+- `instantiateActivity()` 记录最近的 Activity，并在 Activity 可用时展示弹窗
+
+- 重点：避免在过渡 Activity（例如 `PandoraEntry`）上直接 `show()`，否则可能 `WindowLeaked` 导致用户看不到弹窗
 
   
 
@@ -2174,7 +2213,15 @@ detectRoot() (立即检测一次)
 
 │
 
-└─→ 如果检测到 ROOT → dpt_crash()
+└─→ 如果检测到 ROOT：
+
+1) 设置 g_root_detected=true（供 Java 层查询）
+
+2) 启动延迟退出线程（默认 10s 后调用 dpt_crash()）
+
+3) Java 层 watcher 在稳定 Activity 上弹出告警弹窗（并 Toast 兜底）
+
+4) 用户点击“确定”后立即退出进程（避免 ROOT 环境下继续运行泄露风险）
 
 │
 
@@ -2182,7 +2229,7 @@ detectRoot() (立即检测一次)
 
 └─→ 每 10 秒检测一次
 
-└─→ 如果检测到 ROOT → dpt_crash()
+└─→ 如果检测到 ROOT：同上（置位 + 延迟退出）
 
 ```
 
@@ -2400,6 +2447,8 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 - 避免输出敏感信息（如检测路径，已使用字符串混淆）
 
+- **重要**：release 构建下 `DLOG*` 可能会被编译为空（取决于编译宏），排查 Java 弹窗链路建议使用 `[ROOT_WARNING]` 前缀日志
+
   
 
 7. **检测方式启用/禁用**：
@@ -2446,7 +2495,13 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 
 2. **ROOT 设备测试**：
 
-- 在已 ROOT 的设备上运行，应用应立即崩溃
+- 在已 ROOT 的设备上运行：
+
+- 应在稳定界面出现后弹出 **安全告警弹窗**
+
+- 默认在 **约 10 秒后自动退出**
+
+- 点击弹窗“确定”后应 **立即退出**
 
 - 测试不同的 ROOT 工具（SuperSU、Magisk、KingRoot、KernelSU 等）
 
