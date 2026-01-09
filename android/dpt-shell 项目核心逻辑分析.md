@@ -1248,7 +1248,7 @@ public class FeatureManager {
 ```  
   
 **防截屏功能模块**：  
-```java  
+```java
 // shell/src/main/java/com/luoyesiqiu/shell/feature/ScreenshotProtectFeature.java  
 public class ScreenshotProtectFeature {  
     private static volatile boolean sEnabled = false;  
