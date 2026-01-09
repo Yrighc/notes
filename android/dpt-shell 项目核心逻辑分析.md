@@ -29,96 +29,6 @@ dpt-shell 是一个 Android DEX 函数抽取壳，采用"编译时抽取 + 运�
     ↓8. 打包、对齐、签名  
     ↓输出加壳 APK```  
   
-### 2.1.1 `dpt.jar` 命令行参数（完整清单）  
-  
-`dpt` 模块是一个 Java 命令行工具，入口为 `java -jar dpt.jar`，负责对输入 APK/AAB 进行加固并输出加壳包。  
-  
-**基本用法**：  
-  
-```bash  
-java -jar dpt.jar [options] -f <package_file>```  
-  
-#### 2.1.1.1 参数列表（含意义 / 用法 / 示例）  
-  
-> 说明：`-f/--package-file` 是唯一必填参数，其余均为可选参数。  
-  
-| 参数 | 是否带值 | 默认值 | 意义 | 用法示例 |  
-|---|---:|---|---|---|  
-| `-f`, `--package-file <path>` | ✅ | - | **输入文件路径**（待加固的 `*.apk` / `*.aab`） | `java -jar dpt.jar -f app.apk` |  
-| `-o`, `--output <path>` | ✅ | 当前目录（`user.dir`） | **输出路径**：可传“目录”或“完整文件名”。传目录：输出到该目录；传文件：输出到该文件名。 | `-o out/` / `-o out/protected.apk` |  
-| `-x`, `--no-sign` | ❌ | 签名 | **不对输出包签名**（只输出未签名结果） | `--no-sign` |  
-| `--debug` | ❌ | 关闭 | **将输出包设置为 debuggable**（仅用于调试/排查） | `--debug` |  
-| `--noisy-log` | ❌ | 关闭 | **开启 dpt 工具的详细日志**（用于排查打包/处理流程） | `--noisy-log` |  
-| `--dump-code` | ❌ | 关闭 | **转储 DEX 的 CodeItem 到 `.json`**（用于分析/验证抽取结果） | `--dump-code` |  
-| `-r`, `--rules-file <path>` | ✅ | - | **排除规则文件**：匹配到的类/包名不做抽取保护（保留在原 DEX 中），可用于兼容性兜底 | `-r rules.txt` |  
-| `-K`, `--keep-classes` | ❌ | 关闭 | **启用“保留类”策略**：配合 `--rules-file` 将匹配规则的类保留在包内，用于改善启动性能/兼容性（部分包不支持） | `-K -r rules.txt` |  
-| `-e`, `--exclude-abi <list>` | ✅ | - | **排除特定 ABI**（逗号分隔）。支持：`arm(armeabi-v7a)`, `arm64(arm64-v8a)`, `x86`, `x86_64` | `-e x86,x86_64` |  
-| `-S`, `--smaller` | ❌ | 关闭 | **体积优化**：以部分性能换更小包体 | `--smaller` |  
-| `-c`, `--protect-config <path>` | ✅ | 使用随机配置 | **保护配置文件**：用于指定 `shellPkgName`（壳包名）和签名配置等 | `-c dpt-protect-config.json` |  
-| `--disable-acf` | ❌ | 关闭 | **禁用 AppComponentFactory 注入**（仅用于调试；会影响 `ProxyComponentFactory` 入口） | `--disable-acf` |  
-| `--enable-root-detect` | ❌ | **关闭 ROOT 检测加固** | **启用 ROOT 检测加固**：输出包运行时会执行 `detectRoot()`，检测到 ROOT 后弹告警并延迟退出 | `--enable-root-detect` |  
-| `--disable-root-detect` | ❌ | 关闭 ROOT 检测加固 | **强制关闭 ROOT 检测加固**（兜底/兼容旧脚本；与 `--enable-root-detect` 同时出现时，以 disable 为准） | `--disable-root-detect` |  
-| `-v`, `--version` | ❌ | - | **打印 dpt 工具版本号** | `--version` |  
-  
-#### 2.1.1.2 常用组合示例  
-  
-- **最常用（默认签名、默认关闭 ROOT 检测加固）**：  
-  
-```bash  
-java -jar dpt.jar -f input.apk -o out/```  
-  
-- **开启 ROOT 检测加固**（按需）：  
-  
-```bash  
-java -jar dpt.jar --enable-root-detect -f input.apk -o out/```  
-  
-- **指定输出文件名**：  
-  
-```bash  
-java -jar dpt.jar -f input.apk -o out/protected.apk```  
-  
-- **调试/排查场景（开启 verbose 日志 + 可调试包）**：  
-  
-```bash  
-java -jar dpt.jar --noisy-log --debug -f input.apk -o out/```  
-  
-- **兼容性兜底：保留特定类不做保护**（配合规则文件）：  
-  
-```bash  
-java -jar dpt.jar -K -r executable/dpt-exclude-classes-template.rules -f input.apk -o out/```  
-  
-#### 2.1.1.3 `--protect-config`（保护配置文件）说明  
-  
-该文件用于**控制壳包名**和**输出包签名**等（示例模板：`executable/dpt-protect-config-template.json`）：  
-  
-```json  
-{  
-  "shellPkgName": "<random>",  "signature": {    "keystore": "/path/to/keystore.jks",    "alias": "key0",    "storepass": "android",    "keypass": "android"  }}  
-```  
-  
-- **`shellPkgName`**：  
-  - `<random>` 表示每次生成随机壳包名（增强特征差异）  
-  - 也可写固定包名（便于联调/对齐白名单场景）  
-- **`signature`**：  
-  - 配置输出包的签名（建议生产使用自定义 keystore）  
-  - 若不需要签名，可使用 `--no-sign`  
-  
-#### 2.1.1.4 `--rules-file`（排除规则文件）格式说明  
-  
-规则文件是**逐行匹配**的“类名规则”，用于告诉 dpt：哪些类/包不要做抽取保护（通常用于三方库、系统库、某些不兼容包的兜底）。  
-  
-- **文件模板**：`executable/dpt-exclude-classes-template.rules`  
-- **规则含义**：每行一个模式，通常使用 DEX 类型描述符形式，例如：  
-  - `Lcom/google/.*`：排除 `com.google.*` 相关类  
-  - `Lio/dcloud/.*`：排除 `io.dcloud.*` 相关类（你当前样例包里就有）  
-  
-**示例**：  
-  
-```text  
-Lcom/example/unstable/.*  
-Lio/dcloud/.*  
-```  
-  
 ### 2.2 运行时执行流程（shell 模块）  
   
 ```  
@@ -126,23 +36,31 @@ App 启动
     ↓1. ProxyApplication.attachBaseContext()  
    - 解压 shell SO 文件到 dataDir   - 加载 shell SO（System.load）  
    - 调用 JniBridge.ia() 初始化  
-    ↓2. SO 加载时（.init_array）  
+    ↓2. SO 加载时（JNI_OnLoad）  
+   - read_shell_config() 读取加密配置文件（包含 root_detect 等配置）  
+   - 注册 JNI 方法  
+   - 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）  
+    ↓3. SO 加载时（.init_array）  
    - init_dpt() 执行：  
      * 解密 .bitcode 段（如果启用）  
-     * dpt_hook() 进行 Hook     *（反调试/反风险逻辑改为在读取配置后启动：见 JNI_OnLoad）  
-    ↓3. Hook 关键函数：  
+     * dpt_hook() 进行 Hook    ↓4. Hook 关键函数：  
    - hook_mmap()：使 DEX 内存可写  
    - hook_DefineClass()：拦截类加载  
-   - hook_execve()：阻止 dex2oat    ↓4. JniBridge.ia() 执行：  
+   - hook_execve()：阻止 dex2oat    ↓5. createAntiRiskProcess() 执行（延迟线程中）：  
+   - 根据 root_detect 配置决定是否执行 ROOT 检测  
+   - fork() 子进程进行反调试检测  
+   - 主进程：监控子进程 + 检测 Frida + ROOT（如果启用）  
+   - 子进程：ptrace 反调试 + ROOT（如果启用）  
+    ↓6. JniBridge.ia() 执行：  
    - 从 APK 中读取 CodeItem 文件  
    - 解析并加载到内存（dexMap）  
-   - 提取 DEX 文件到 dataDir    ↓5. combineDexElements()：  
+   - 提取 DEX 文件到 dataDir    ↓7. combineDexElements()：  
    - 将提取的 DEX 合并到 ClassLoader   - 优先从壳的 DEX 查找类  
-    ↓6. 类加载时（DefineClass Hook）：  
+    ↓8. 类加载时（DefineClass Hook）：  
    - 检测到类被加载  
    - 遍历类的所有方法  
    - 从 dexMap 查找对应的 CodeItem   - 将 CodeItem 写回方法体位置  
-    ↓7. ProxyApplication.onCreate()：  
+    ↓9. ProxyApplication.onCreate()：  
    - 调用原 Application.onCreate()   - 应用正常启动  
 ```  
   
@@ -242,7 +160,8 @@ ZipAlign.alignZip(randomAccessFile, out);
   
 **处理过程**：  
 ```java  
-List<File> dexFiles = getDexFiles(getDexDir(packageDir));for (File dexFile : dexFiles) {  
+List<File> dexFiles = getDexFiles(getDexDir(packageDir));  
+for (File dexFile : dexFiles) {  
     dexFile.delete();  // 删除所有 .dex 文件  
 }  
 ```  
@@ -314,7 +233,8 @@ uint8_t* zipData = dexBegin + (dexSize - zipLen - 4);
   
 **处理过程**：  
 ```java  
-File keepDexTempDir = getKeepDexTempDir(packageDir);File[] files = keepDexTempDir.listFiles();  
+File keepDexTempDir = getKeepDexTempDir(packageDir);  
+File[] files = keepDexTempDir.listFiles();  
   
 // 将保留的 DEX 文件添加到 DEX 目录  
 for (File file : files) {  
@@ -850,53 +770,123 @@ bool isRootDetected();
 - `instantiateActivity()` 记录最近的 Activity，并在 Activity 可用时展示弹窗  
 - 重点：避免在过渡 Activity（例如 `PandoraEntry`）上直接 `show()`，否则可能 `WindowLeaked` 导致用户看不到弹窗  
   
-#### 4.3.5 集成位置  
+#### 4.3.5 命令行参数控制  
   
-**集成到 `createAntiRiskProcess()`**：  
+**参数说明**：  
+- `--enable-root-detect`：启用 ROOT 检测加固功能（**默认关闭**）  
+- `--disable-root-detect`：强制禁用 ROOT 检测加固功能（即使已启用）  
+  
+**使用示例**：  
+```bash  
+# 启用 ROOT 检测  
+java -jar dpt.jar -f input.apk -o out/ --enable-root-detect  
+  
+# 禁用 ROOT 检测（默认行为，可省略）  
+java -jar dpt.jar -f input.apk -o out/  
+  
+# 强制禁用 ROOT 检测（即使之前启用过）  
+java -jar dpt.jar -f input.apk -o out/ --disable-root-detect  
+```  
+  
+**配置传递机制**：  
+1. **编译时**：`dpt.jar` 将 `root_detect` 配置写入加密的 JSON 配置文件 `d_shell_data_001`，存储在 APK 的 `assets` 目录  
+2. **运行时**：shell 在 `JNI_OnLoad()` 中读取并解密配置文件，解析 JSON 获取 `root_detect` 字段  
+3. **执行控制**：根据 `root_detect` 配置值决定是否执行 `detectRoot()`  
+  
+**配置写入位置**：  
+```java  
+// dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java  
+public void writeConfig(String packageDir, byte[] key) {  
+    // ...    JSONObject jsonObject = new JSONObject(baseJson);    jsonObject.put("root_detect", isRootDetect());  // 写入 root_detect 配置  
+    String json = jsonObject.toString();    // AES 加密后写入 assets/d_shell_data_001}  
+```  
+  
+**配置读取位置**：  
+```cpp  
+// shell/src/main/cpp/dpt.cpp::read_shell_config()  
+void read_shell_config(JNIEnv *env) {  
+    // 从 APK 读取并解密配置文件  
+    // 解析 JSON，读取 root_detect 字段  
+    g_shell_config.root_detect = shell_config.value("root_detect", false);}  
+```  
+  
+#### 4.3.6 集成位置  
+  
+**集成到 `createAntiRiskProcess()`**（**条件执行**）：  
 ```cpp  
 // dpt.cpp::createAntiRiskProcess()  
 DPT_ENCRYPT void createAntiRiskProcess() {  
-    // 首先检测 ROOT（在主进程和子进程都要检测）  
-    detectRoot();        pid_t child = fork();  
-    if(child < 0) {        // fork 失败  
-        DLOGW("fork fail!");        detectFrida();        detectRoot();  // 添加 ROOT 检测  
-    }    else if(child == 0) {        // 子进程：检测 Frida、ROOT 和 ptrace        DLOGD("in child process");        detectFrida();        detectRoot();  // 添加 ROOT 检测  
-        doPtrace();    }    else {        // 主进程：监控子进程 + 检测 Frida 和 ROOT        DLOGD("in main process, child pid: %d", child);        protectChildProcess(child);        detectFrida();        detectRoot();  // 添加 ROOT 检测  
-    }}  
+    // 根据配置决定是否检测 ROOT（其他反调试功能始终启用）  
+    if (g_shell_config.root_detect) {        // ROOT 检测已启用，首先检测 ROOT（在主进程和子进程都要检测）  
+        detectRoot();    } else {        // ROOT 检测已禁用，跳过 ROOT 检测（不影响其他反调试功能）  
+    }    // fork 子进程（无论 ROOT 检测是否启用，都要执行反调试功能）  
+    pid_t child = fork();    if(child < 0) {        // fork 失败，只检测 Frida（和 ROOT，如果启用）  
+        detectFrida();        if (g_shell_config.root_detect) {            detectRoot();        }    }    else if(child == 0) {        // 子进程：检测 ptrace（和 ROOT，如果启用）  
+        // 注意：子进程中不调用 detectFrida()，避免创建线程导致问题  
+        if (g_shell_config.root_detect) {            detectRoot();        }        doPtrace();  // ptrace 反调试始终执行  
+    }    else {        // 主进程：监控子进程 + 检测 Frida（和 ROOT，如果启用）  
+        protectChildProcess(child);  // 子进程监控始终执行  
+        detectFrida();  // Frida 检测始终执行  
+        if (g_shell_config.root_detect) {            detectRoot();        }    }}  
 ```  
   
-#### 4.3.6 执行流程  
+**重要说明**：  
+- ✅ **ROOT 检测可根据命令行参数控制**：默认关闭，使用 `--enable-root-detect` 启用  
+- ✅ **其他反调试功能不受影响**：Frida 检测、ptrace 反调试、子进程监控等功能始终执行  
+- ✅ **配置通过加密 JSON 传递**：编译时写入，运行时读取，确保安全性  
+  
+#### 4.3.7 执行流程  
   
 ```  
 应用启动  
-    ↓init_dpt() (SO 加载时，.init_array)  
-    ↓createAntiRiskProcess()  
-    ↓detectRoot() (立即检测一次)  
-    ├─→ isRooted() 综合检测（10 种已启用的检测方式）  
-    │   ├─→ 方式 1：检测 su 文件路径（15 个路径）✅  
-    │   ├─→ 方式 2：检测 Magisk 文件（7 个路径）✅  
-    │   ├─→ 方式 3：检测系统属性（ro.build.tags, ro.secure）✅  
-    │   ├─→ 方式 4：检测 root 管理应用（包括 KernelSU 应用）✅  
-    │   ├─→ 方式 5：检测 PATH 中的 su ✅  
-    │   ├─→ 方式 6：检测 SELinux 状态 ✅  
-    │   ├─→ 方式 7：检测 KernelSU 文件路径（7 个路径）✅  
-    │   ├─→ 方式 8：检测进程 UID（/proc/self/status）✅  
-    │   ├─→ 方式 9：检测系统分区挂载状态 ❌ 已禁用  
-    │   ├─→ 方式 10：检测内核符号表 ❌ 已禁用  
-    │   ├─→ 方式 11：检测内核模块（/proc/modules）✅  
-    │   ├─→ 方式 12：检测 SELinux 状态文件（/sys/fs/selinux/status）✅  
-    │   └─→ 方式 13：尝试执行 su 命令 ❌ 已禁用  
-    │    └─→ 如果检测到 ROOT：  
-          1) 设置 g_root_detected=true（供 Java 层查询）  
-          2) 启动延迟退出线程（默认 10s 后调用 dpt_crash()）  
-          3) Java 层 watcher 在稳定 Activity 上弹出告警弹窗（并 Toast 兜底）  
-          4) 用户点击“确定”后立即退出进程（避免 ROOT 环境下继续运行泄露风险）  
-    │    └─→ 启动 detectRootOnThread() 后台线程  
-        └─→ 每 10 秒检测一次  
-            └─→ 如果检测到 ROOT：同上（置位 + 延迟退出）  
+    ↓ProxyApplication.attachBaseContext()  
+    ↓加载 shell SO（System.load）  
+    ↓JNI_OnLoad()（SO 加载时）  
+    ├─→ read_shell_config() 读取加密配置文件  
+    │   ├─→ 从 APK assets/d_shell_data_001 读取  
+    │   ├─→ AES 解密  
+    │   ├─→ 解析 JSON，读取 root_detect 字段  
+    │   └─→ 设置 g_shell_config.root_detect    │    └─→ 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）  
+        └─→ createAntiRiskProcess()            ├─→ 根据 g_shell_config.root_detect 决定是否执行 detectRoot()            │   └─→ 如果 root_detect = true：  
+            │       └─→ detectRoot()（立即检测一次）  
+            │           ├─→ isRooted() 综合检测（10 种已启用的检测方式）  
+            │           │   ├─→ 方式 1：检测 su 文件路径（15 个路径）✅  
+            │           │   ├─→ 方式 2：检测 Magisk 文件（7 个路径）✅  
+            │           │   ├─→ 方式 3：检测系统属性（ro.build.tags, ro.secure）✅  
+            │           │   ├─→ 方式 4：检测 root 管理应用（包括 KernelSU 应用）✅  
+            │           │   ├─→ 方式 5：检测 PATH 中的 su ✅  
+            │           │   ├─→ 方式 6：检测 SELinux 状态 ✅  
+            │           │   ├─→ 方式 7：检测 KernelSU 文件路径（7 个路径）✅  
+            │           │   ├─→ 方式 8：检测进程 UID（/proc/self/status）✅  
+            │           │   ├─→ 方式 9：检测系统分区挂载状态 ❌ 已禁用  
+            │           │   ├─→ 方式 10：检测内核符号表 ❌ 已禁用  
+            │           │   ├─→ 方式 11：检测内核模块（/proc/modules）✅  
+            │           │   ├─→ 方式 12：检测 SELinux 状态文件（/sys/fs/selinux/status）✅  
+            │           │   └─→ 方式 13：尝试执行 su 命令 ❌ 已禁用  
+            │           │            │           └─→ 如果检测到 ROOT：  
+            │               ├─→ 设置 g_root_detected=true（供 Java 层查询）  
+            │               ├─→ 启动延迟退出线程（默认 10s 后调用 dpt_crash()）  
+            │               └─→ Java 层 watcher 在稳定 Activity 上弹出告警弹窗  
+            │           │            │           └─→ 启动 detectRootOnThread() 后台线程  
+            │               └─→ 每 10 秒检测一次  
+            │                   └─→ 如果检测到 ROOT：同上（置位 + 延迟退出）  
+            │            ├─→ fork() 子进程（无论 ROOT 检测是否启用，都要执行）  
+            │            ├─→ 主进程分支：  
+            │   ├─→ protectChildProcess()（子进程监控，始终执行）  
+            │   ├─→ detectFrida()（Frida 检测，始终执行）  
+            │   └─→ detectRoot()（如果 root_detect = true）  
+            │            └─→ 子进程分支：  
+                ├─→ detectRoot()（如果 root_detect = true）  
+                └─→ doPtrace()（ptrace 反调试，始终执行）  
 ```  
   
-#### 4.3.7 字符串混淆  
+**关键点说明**：  
+1. **配置读取时机**：在 `JNI_OnLoad()` 中读取，确保在反调试逻辑执行前完成  
+2. **延迟启动**：`createAntiRiskProcess()` 在延迟线程中执行（延迟 500ms），避免在 `JNI_OnLoad()` 中直接 `fork()` 导致崩溃  
+3. **条件执行**：ROOT 检测根据 `root_detect` 配置值决定是否执行，其他反调试功能始终执行  
+4. **不影响其他功能**：Frida 检测、ptrace 反调试、子进程监控等功能不受 ROOT 检测开关影响  
+  
+#### 4.3.8 字符串混淆  
   
 **使用 AY_OBFUSCATE 宏**：  
 所有检测路径都应该使用 `AY_OBFUSCATE()` 宏进行字符串混淆，防止静态分析：  
@@ -907,7 +897,7 @@ const char *magisk_path = AY_OBFUSCATE("/sbin/magisk");
 const char *prop_name = AY_OBFUSCATE("ro.build.tags");  
 ```  
   
-#### 4.3.8 KernelSU 检测说明  
+#### 4.3.9 KernelSU 检测说明  
   
 **KernelSU 的特殊性**：  
 - KernelSU 是**内核级 ROOT 方案**，通过修改内核实现 ROOT 权限  
@@ -930,7 +920,7 @@ const char *prop_name = AY_OBFUSCATE("ro.build.tags");
 - 已禁用的检测方式（方式 9、10、13）虽然可能提高检测率，但容易误报，因此已禁用  
 - 建议定期更新检测方式，以应对 KernelSU 的更新  
   
-#### 4.3.9 误报风险与已禁用检测方式说明  
+#### 4.3.10 误报风险与已禁用检测方式说明  
   
 **可能导致误报的检测方式（已禁用）**：  
   
@@ -1203,7 +1193,9 @@ public static boolean verifySignature(Context context) {
 @Override  
 protected void onCreate(Bundle savedInstanceState) {  
     super.onCreate(savedInstanceState);  
-    getWindow().setFlags(        WindowManager.LayoutParams.FLAG_SECURE,        WindowManager.LayoutParams.FLAG_SECURE    );}  
+    getWindow().setFlags(  
+        WindowManager.LayoutParams.FLAG_SECURE,        WindowManager.LayoutParams.FLAG_SECURE    );  
+}  
 ```  
   
 ### 4.13 SharePreferences/SQLite 加密  
