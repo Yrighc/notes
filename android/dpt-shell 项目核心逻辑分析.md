@@ -25,7 +25,7 @@ dpt-shell 是一个 Android DEX 函数抽取壳，采用"编译时抽取 + 运�
     ↓5. 修改 AndroidManifest.xml：  
    - 备份原 Application 类名  
    - 替换为 ProxyApplication    ↓6. 集成 shell 模块：  
-   - 将 shell 的 DEX 和 SO 文件添加到 APK   - 将 CodeItem 文件添加到 assets    ↓7. 生成垃圾代码 DEX（可选）  
+   - 将 shell 的 DEX 和 SO 文件添加到 APK   - 将 CodeItem 文件添加到 assets   - 将加密的 shell 配置文件（包含 root_detect、screenshot_protect 等配置）添加到 assets    ↓7. 生成垃圾代码 DEX（可选）  
     ↓8. 打包、对齐、签名  
     ↓输出加壳 APK```  
   
@@ -37,8 +37,8 @@ App 启动
    - 解压 shell SO 文件到 dataDir   - 加载 shell SO（System.load）  
    - 调用 JniBridge.ia() 初始化  
     ↓2. SO 加载时（JNI_OnLoad）  
-   - read_shell_config() 读取加密配置文件（包含 root_detect 等配置）  
-   - 注册 JNI 方法  
+   - read_shell_config() 读取加密配置文件（包含 root_detect、screenshot_protect 等配置）  
+   - 注册 JNI 方法（包括 isRootDetectEnabled、isScreenshotProtectEnabled）  
    - 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）  
     ↓3. SO 加载时（.init_array）  
    - init_dpt() 执行：  
@@ -61,6 +61,10 @@ App 启动
    - 遍历类的所有方法  
    - 从 dexMap 查找对应的 CodeItem   - 将 CodeItem 写回方法体位置  
     ↓9. ProxyApplication.onCreate()：  
+   - 初始化功能管理器（FeatureManager.initialize()）  
+     * 根据配置启用/禁用 ROOT 检测和防截屏功能  
+   - 注册 ActivityLifecycleCallbacks     * onActivityCreated() → 应用防截屏保护（第一重）  
+     * onActivityResumed() → 应用防截屏保护（第二重，双重保险）  
    - 调用原 Application.onCreate()   - 应用正常启动  
 ```  
   
@@ -1184,19 +1188,187 @@ public static boolean verifySignature(Context context) {
   
 ### 4.12 防截屏  
   
-**实现思路**：  
-1. 在 Activity 中设置 `FLAG_SECURE`  
-2. 检测截屏事件（MediaProjection API）  
+#### 4.12.1 实现思路  
   
-**实现代码示例**：  
+防截屏功能通过设置 Android 的 `FLAG_SECURE` 窗口标志来防止用户截屏和录屏。该功能采用**统一的功能管理架构**，与其他功能模块解耦，便于扩展和维护。  
+  
+**核心机制**：  
+- 使用 `WindowManager.LayoutParams.FLAG_SECURE` 标志  
+- 采用**双重保险**策略：在 Activity 创建和恢复时都应用保护  
+- 通过命令行参数控制，默认关闭，按需启用  
+- 配置通过加密 JSON 传递，确保安全性  
+  
+#### 4.12.2 命令行参数控制  
+  
+**参数说明**：  
+- `--enable-screenshot-protect`：启用防截屏加固功能（**默认关闭**）  
+  
+**使用示例**：  
+```bash  
+# 启用防截屏功能  
+java -jar dpt.jar -f input.apk -o out/ --enable-screenshot-protect  
+  
+# 同时启用 ROOT 检测和防截屏  
+java -jar dpt.jar -f input.apk -o out/ --enable-root-detect --enable-screenshot-protect  
+```  
+  
+#### 4.12.3 配置传递机制  
+  
+**配置写入位置**：  
 ```java  
+// dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java  
+public void writeConfig(String packageDir, byte[] key) {  
+    // ...    JSONObject jsonObject = new JSONObject(baseJson);    jsonObject.put("root_detect", isRootDetect());    jsonObject.put("screenshot_protect", isScreenshotProtect());  // 写入防截屏配置  
+    String json = jsonObject.toString();    // AES 加密后写入 assets/d_shell_data_001}  
+```  
+  
+**配置读取位置**：  
+```cpp  
+// shell/src/main/cpp/dpt.cpp::read_shell_config()  
+void read_shell_config(JNIEnv *env) {  
+    // 从 APK 读取并解密配置文件  
+    // 解析 JSON，读取 screenshot_protect 字段  
+    g_shell_config.screenshot_protect = shell_config.value("screenshot_protect", false);}  
+```  
+  
+#### 4.12.4 功能管理架构  
+  
+**统一功能管理接口**：  
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/feature/FeatureManager.java  
+public class FeatureManager {  
+    /**     * 初始化所有功能模块  
+     * 根据配置启用或禁用各个功能  
+     */    public static void initialize(boolean rootDetectEnabled, boolean screenshotProtectEnabled) {        // 初始化防截屏功能  
+        if (screenshotProtectEnabled) {            ScreenshotProtectFeature.enable();        } else {            ScreenshotProtectFeature.disable();        }    }  
+    /**     * 在 Activity 创建时应用所有需要的功能  
+     */    public static void onActivityCreated(Activity activity) {        ScreenshotProtectFeature.applyToActivity(activity);    }  
+    /**     * 在 Activity 恢复时应用所有需要的功能（双重保险）  
+     */    public static void onActivityResumed(Activity activity) {        ScreenshotProtectFeature.applyToActivity(activity);    }}  
+```  
+  
+**防截屏功能模块**：  
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/feature/ScreenshotProtectFeature.java  
+public class ScreenshotProtectFeature {  
+    private static volatile boolean sEnabled = false;  
+    /**     * 为 Activity 应用防截屏保护  
+     */    public static void applyToActivity(Activity activity) {        if (!sEnabled || activity == null) {            return;        }  
+        try {            Window window = activity.getWindow();            if (window != null) {                window.addFlags(WindowManager.LayoutParams.FLAG_SECURE);            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] Failed to apply FLAG_SECURE", t);        }    }}  
+```  
+  
+#### 4.12.5 集成位置  
+  
+**在 ProxyApplication 中初始化**：  
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/ProxyApplication.java  
 @Override  
-protected void onCreate(Bundle savedInstanceState) {  
-    super.onCreate(savedInstanceState);  
-    getWindow().setFlags(  
-        WindowManager.LayoutParams.FLAG_SECURE,        WindowManager.LayoutParams.FLAG_SECURE    );  
+public void onCreate() {  
+    super.onCreate();    // 初始化功能管理器（根据配置启用/禁用各个功能）  
+    boolean rootDetectEnabled = JniBridge.isRootDetectEnabled();    boolean screenshotProtectEnabled = JniBridge.isScreenshotProtectEnabled();    FeatureManager.initialize(rootDetectEnabled, screenshotProtectEnabled);  
+    // 注册 Activity 生命周期回调，应用功能到所有 Activity    registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {        @Override        public void onActivityCreated(Activity activity, Bundle savedInstanceState) {            FeatureManager.onActivityCreated(activity);  // 第一重保护  
+        }                @Override  
+        public void onActivityResumed(Activity activity) {            FeatureManager.onActivityResumed(activity);  // 第二重保护（双重保险）  
+        }        // ... 其他回调方法  
+    });}  
+```  
+  
+**在 ProxyComponentFactory 中应用**：  
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  
+@Override  
+public Activity instantiateActivity(@NonNull ClassLoader cl, @NonNull String className, Intent intent) {  
+    Activity activity = super.instantiateActivity(cl, className, intent);    // 应用功能到新创建的 Activity    FeatureManager.onActivityCreated(activity);        return activity;  
 }  
 ```  
+  
+#### 4.12.6 执行流程  
+  
+```  
+应用启动  
+    ↓ProxyApplication.attachBaseContext()  
+    ↓加载 shell SO（System.load）  
+    ↓JNI_OnLoad()（SO 加载时）  
+    ├─→ read_shell_config() 读取加密配置文件  
+    │   ├─→ 从 APK assets/d_shell_data_001 读取  
+    │   ├─→ AES 解密  
+    │   ├─→ 解析 JSON，读取 screenshot_protect 字段  
+    │   └─→ 设置 g_shell_config.screenshot_protect    │    └─→ 注册 JNI 方法（包括 isScreenshotProtectEnabled）  
+    ↓ProxyApplication.onCreate()  
+    ├─→ JniBridge.isScreenshotProtectEnabled() 查询配置  
+    ├─→ FeatureManager.initialize() 初始化功能管理器  
+    │   └─→ ScreenshotProtectFeature.enable() / disable()    │    └─→ 注册 ActivityLifecycleCallbacks        ├─→ onActivityCreated() → FeatureManager.onActivityCreated()        │   └─→ ScreenshotProtectFeature.applyToActivity()（第一重保护）  
+        │        └─→ onActivityResumed() → FeatureManager.onActivityResumed()            └─→ ScreenshotProtectFeature.applyToActivity()（第二重保护，双重保险）  
+    ↓ProxyComponentFactory.instantiateActivity()  
+    └─→ FeatureManager.onActivityCreated()        └─→ ScreenshotProtectFeature.applyToActivity()（第三重保护，确保覆盖）  
+```  
+  
+#### 4.12.7 双重保险机制  
+  
+**为什么需要双重保险**：  
+1. **Activity 创建时机**：某些 Activity 可能在 `onCreate()` 之后才设置窗口标志，需要再次确认  
+2. **Activity 恢复场景**：从后台恢复的 Activity 可能需要重新应用保护  
+3. **兼容性考虑**：不同 Android 版本和厂商 ROM 的行为可能不同  
+  
+**保护时机**：  
+- **第一重**：`ProxyComponentFactory.instantiateActivity()` 中应用  
+- **第二重**：`ProxyApplication` 的 `onActivityCreated()` 回调中应用  
+- **第三重**：`ProxyApplication` 的 `onActivityResumed()` 回调中应用（双重保险）  
+  
+#### 4.12.8 JNI 接口  
+  
+**JNI 方法注册**：  
+```cpp  
+// shell/src/main/cpp/dpt.cpp  
+static jboolean isScreenshotProtectEnabledJNI(__unused JNIEnv *env, jclass __unused) {  
+    return g_shell_config.screenshot_protect ? JNI_TRUE : JNI_FALSE;}  
+  
+static JNINativeMethod gMethods[] = {  
+    // ... 其他方法  
+    {"isScreenshotProtectEnabled", "()Z", (void *) isScreenshotProtectEnabledJNI},};  
+```  
+  
+**Java 层接口**：  
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/JniBridge.java  
+public static native boolean isScreenshotProtectEnabled();  
+```  
+  
+#### 4.12.9 功能特点  
+  
+**优势**：  
+1. ✅ **解耦设计**：防截屏功能独立模块，不影响其他功能  
+2. ✅ **统一管理**：通过 `FeatureManager` 统一初始化和调用  
+3. ✅ **配置驱动**：通过命令行参数和 JSON 配置控制功能开关  
+4. ✅ **双重保险**：多时机应用保护，确保覆盖所有场景  
+5. ✅ **易于扩展**：新增功能只需添加新模块并在 `FeatureManager` 中注册  
+  
+**限制**：  
+- `FLAG_SECURE` 只能防止系统级截屏和录屏  
+- 无法防止物理拍照（相机拍摄屏幕）  
+- 无法防止通过 ADB 命令截屏（需要 root 权限）  
+- 无法防止某些第三方截屏工具（如果它们有系统权限）  
+  
+#### 4.12.10 测试建议  
+  
+1. **功能测试**：  
+   - 启用防截屏功能后，尝试使用系统截屏快捷键（电源键+音量减）  
+   - 尝试使用系统录屏功能  
+   - 验证是否无法截屏/录屏  
+  
+2. **兼容性测试**：  
+   - 测试不同 Android 版本（5.0+）  
+   - 测试不同厂商 ROM（MIUI、ColorOS、OneUI 等）  
+   - 测试不同 Activity 类型（普通 Activity、Dialog Activity、透明 Activity 等）  
+  
+3. **性能测试**：  
+   - 验证应用启动速度不受影响  
+   - 验证 Activity 切换流畅度不受影响  
+  
+#### 4.12.11 参考资源  
+  
+- **Android FLAG_SECURE 文档**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE  
+- **Android 窗口标志**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams  
   
 ### 4.13 SharePreferences/SQLite 加密  
   
