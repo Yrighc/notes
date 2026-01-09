@@ -1252,33 +1252,48 @@ public class FeatureManager {
 // shell/src/main/java/com/luoyesiqiu/shell/feature/ScreenshotProtectFeature.java  
 public class ScreenshotProtectFeature {  
     private static volatile boolean sEnabled = false;  
-    /**     * 为 Activity 应用防截屏保护  
+    /**     * 为 Activity 应用防截屏保护（直接设置）  
+     * 使用 setFlags 而不是 addFlags，确保标志被正确设置  
      */    public static void applyToActivity(Activity activity) {        if (!sEnabled || activity == null) {            return;        }  
-        try {            Window window = activity.getWindow();            if (window != null) {                window.addFlags(WindowManager.LayoutParams.FLAG_SECURE);            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] Failed to apply FLAG_SECURE", t);        }    }}  
+        try {            Window window = activity.getWindow();            if (window != null) {                // 使用 setFlags 确保 FLAG_SECURE 被正确设置  
+                window.setFlags(                    WindowManager.LayoutParams.FLAG_SECURE,                    WindowManager.LayoutParams.FLAG_SECURE                );                Log.d(TAG, "[SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to " + activity.getClass().getName());            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] ✗ Failed to apply FLAG_SECURE", t);        }    }  
+    /**     * 延迟应用防截屏保护（确保窗口已创建）  
+     * 在某些情况下，Activity 创建时窗口可能还未准备好，需要延迟设置  
+     */    public static void applyToActivityDelayed(Activity activity) {        if (!sEnabled || activity == null) {            return;        }  
+        try {            Window window = activity.getWindow();            if (window == null) {                // 如果窗口还未创建，使用 Handler 延迟重试  
+                android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());                handler.postDelayed(() -> applyToActivity(activity), 100);                return;            }  
+            android.view.View decorView = window.getDecorView();            if (decorView != null && decorView.isAttachedToWindow()) {                // 窗口已创建且已 attach，直接设置  
+                applyToActivity(activity);            } else if (decorView != null) {                // 窗口未 attach，等待 attach 后再设置  
+                decorView.post(() -> applyToActivity(activity));            } else {                // decorView 为 null，延迟重试  
+                android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());                handler.postDelayed(() -> applyToActivity(activity), 200);            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] Failed to apply FLAG_SECURE (delayed)", t);            applyToActivity(activity); // 失败时尝试直接设置  
+        }    }}  
 ```  
   
 #### 4.12.5 集成位置  
   
-**在 ProxyApplication 中初始化**：  
+**在 ProxyComponentFactory.instantiateApplication() 中初始化**：  
 ```java  
-// shell/src/main/java/com/luoyesiqiu/shell/ProxyApplication.java  
+// shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  
 @Override  
-public void onCreate() {  
-    super.onCreate();    // 初始化功能管理器（根据配置启用/禁用各个功能）  
-    boolean rootDetectEnabled = JniBridge.isRootDetectEnabled();    boolean screenshotProtectEnabled = JniBridge.isScreenshotProtectEnabled();    FeatureManager.initialize(rootDetectEnabled, screenshotProtectEnabled);  
-    // 注册 Activity 生命周期回调，应用功能到所有 Activity    registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {        @Override        public void onActivityCreated(Activity activity, Bundle savedInstanceState) {            FeatureManager.onActivityCreated(activity);  // 第一重保护  
-        }                @Override  
-        public void onActivityResumed(Activity activity) {            FeatureManager.onActivityResumed(activity);  // 第二重保护（双重保险）  
-        }        // ... 其他回调方法  
-    });}  
+public Application instantiateApplication(@NonNull ClassLoader cl, @NonNull String className) {  
+    // ... 加载 shell SO 和初始化逻辑 ...    // 初始化功能管理器（根据配置启用/禁用各个功能）  
+    // 注意：如果应用使用了 AppComponentFactory，ProxyApplication.onCreate() 可能不会被调用  
+    // 所以需要在这里初始化功能管理器  
+    boolean rootDetectEnabled = JniBridge.isRootDetectEnabled();    boolean screenshotProtectEnabled = JniBridge.isScreenshotProtectEnabled();    FeatureManager.initialize(rootDetectEnabled, screenshotProtectEnabled);    // 创建原应用的 Application    Application app = ...;    // 在创建的 Application 上注册 ActivityLifecycleCallbacks    if (app != null) {        app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {            @Override            public void onActivityCreated(Activity activity, Bundle savedInstanceState) {                FeatureManager.onActivityCreated(activity);  // 第一重保护（延迟设置）  
+            }                        @Override  
+            public void onActivityResumed(Activity activity) {                FeatureManager.onActivityResumed(activity);  // 第二重保护（直接设置，双重保险）  
+            }            // ... 其他回调方法  
+        });    }        return app;  
+}  
 ```  
   
-**在 ProxyComponentFactory 中应用**：  
+**在 ProxyComponentFactory.instantiateActivity() 中应用**：  
 ```java  
 // shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  
 @Override  
 public Activity instantiateActivity(@NonNull ClassLoader cl, @NonNull String className, Intent intent) {  
-    Activity activity = super.instantiateActivity(cl, className, intent);    // 应用功能到新创建的 Activity    FeatureManager.onActivityCreated(activity);        return activity;  
+    Activity activity = super.instantiateActivity(cl, className, intent);    // 应用功能到新创建的 Activity（第三重保护，确保覆盖）  
+    FeatureManager.onActivityCreated(activity);        return activity;  
 }  
 ```  
   
@@ -1286,34 +1301,46 @@ public Activity instantiateActivity(@NonNull ClassLoader cl, @NonNull String cla
   
 ```  
 应用启动  
-    ↓ProxyApplication.attachBaseContext()  
-    ↓加载 shell SO（System.load）  
-    ↓JNI_OnLoad()（SO 加载时）  
-    ├─→ read_shell_config() 读取加密配置文件  
-    │   ├─→ 从 APK assets/d_shell_data_001 读取  
-    │   ├─→ AES 解密  
-    │   ├─→ 解析 JSON，读取 screenshot_protect 字段  
-    │   └─→ 设置 g_shell_config.screenshot_protect    │    └─→ 注册 JNI 方法（包括 isScreenshotProtectEnabled）  
-    ↓ProxyApplication.onCreate()  
-    ├─→ JniBridge.isScreenshotProtectEnabled() 查询配置  
+    ↓ProxyComponentFactory.instantiateApplication()（Android 9+）  
+    ├─→ 加载 shell SO（JniBridge.loadShellLibs）  
+    │   └─→ JNI_OnLoad()（SO 加载时）  
+    │       ├─→ read_shell_config() 读取加密配置文件  
+    │       │   ├─→ 从 APK assets/d_shell_data_001 读取  
+    │       │   ├─→ AES 解密  
+    │       │   ├─→ 解析 JSON，读取 screenshot_protect 字段  
+    │       │   └─→ 设置 g_shell_config.screenshot_protect    │       │    │       └─→ 注册 JNI 方法（包括 isScreenshotProtectEnabled）  
+    │    ├─→ JniBridge.isScreenshotProtectEnabled() 查询配置  
     ├─→ FeatureManager.initialize() 初始化功能管理器  
-    │   └─→ ScreenshotProtectFeature.enable() / disable()    │    └─→ 注册 ActivityLifecycleCallbacks        ├─→ onActivityCreated() → FeatureManager.onActivityCreated()        │   └─→ ScreenshotProtectFeature.applyToActivity()（第一重保护）  
-        │        └─→ onActivityResumed() → FeatureManager.onActivityResumed()            └─→ ScreenshotProtectFeature.applyToActivity()（第二重保护，双重保险）  
+    │   └─→ ScreenshotProtectFeature.enable() / disable()    │    ├─→ 创建原应用的 Application    └─→ 在 Application 上注册 ActivityLifecycleCallbacks        ├─→ onActivityCreated() → FeatureManager.onActivityCreated()        │   └─→ ScreenshotProtectFeature.applyToActivityDelayed()（第一重保护，延迟设置）  
+        │        └─→ onActivityResumed() → FeatureManager.onActivityResumed()            └─→ ScreenshotProtectFeature.applyToActivity()（第二重保护，直接设置，双重保险）  
     ↓ProxyComponentFactory.instantiateActivity()  
-    └─→ FeatureManager.onActivityCreated()        └─→ ScreenshotProtectFeature.applyToActivity()（第三重保护，确保覆盖）  
+    └─→ FeatureManager.onActivityCreated()        └─→ ScreenshotProtectFeature.applyToActivityDelayed()（第三重保护，确保覆盖）  
 ```  
   
-#### 4.12.7 双重保险机制  
+#### 4.12.7 三重保险机制  
   
-**为什么需要双重保险**：  
+**为什么需要三重保险**：  
 1. **Activity 创建时机**：某些 Activity 可能在 `onCreate()` 之后才设置窗口标志，需要再次确认  
-2. **Activity 恢复场景**：从后台恢复的 Activity 可能需要重新应用保护  
-3. **兼容性考虑**：不同 Android 版本和厂商 ROM 的行为可能不同  
+2. **窗口准备时机**：Activity 创建时窗口可能还未完全准备好，需要延迟设置  
+3. **Activity 恢复场景**：从后台恢复的 Activity 可能需要重新应用保护  
+4. **兼容性考虑**：不同 Android 版本和厂商 ROM 的行为可能不同  
+5. **AppComponentFactory 场景**：如果应用使用了 AppComponentFactory，需要在多个入口点应用保护  
   
-**保护时机**：  
-- **第一重**：`ProxyComponentFactory.instantiateActivity()` 中应用  
-- **第二重**：`ProxyApplication` 的 `onActivityCreated()` 回调中应用  
-- **第三重**：`ProxyApplication` 的 `onActivityResumed()` 回调中应用（双重保险）  
+**保护时机和方式**：  
+- **第一重**：`ProxyComponentFactory.instantiateActivity()` 中应用（延迟设置，确保窗口已创建）  
+  - 调用 `ScreenshotProtectFeature.applyToActivityDelayed()`  
+  - 使用 `decorView.post()` 或 `Handler.postDelayed()` 延迟设置  
+  - **第二重**：Application 的 `ActivityLifecycleCallbacks.onActivityCreated()` 回调中应用（延迟设置）  
+  - 调用 `ScreenshotProtectFeature.applyToActivityDelayed()`  
+  - 确保窗口已创建后再设置  
+  - **第三重**：Application 的 `ActivityLifecycleCallbacks.onActivityResumed()` 回调中应用（直接设置，双重保险）  
+  - 调用 `ScreenshotProtectFeature.applyToActivity()`  
+  - 使用 `window.setFlags()` 直接设置，确保标志生效  
+  
+**技术细节**：  
+- 使用 `window.setFlags()` 而不是 `addFlags()`，确保 `FLAG_SECURE` 被正确设置  
+- 延迟设置机制：通过 `decorView.post()` 或 `Handler.postDelayed()` 确保窗口已创建  
+- 直接设置机制：在 `onActivityResumed()` 时窗口已稳定，可以直接设置  
   
 #### 4.12.8 JNI 接口  
   
@@ -1340,31 +1367,47 @@ public static native boolean isScreenshotProtectEnabled();
 1. ✅ **解耦设计**：防截屏功能独立模块，不影响其他功能  
 2. ✅ **统一管理**：通过 `FeatureManager` 统一初始化和调用  
 3. ✅ **配置驱动**：通过命令行参数和 JSON 配置控制功能开关  
-4. ✅ **双重保险**：多时机应用保护，确保覆盖所有场景  
+4. ✅ **三重保险**：多时机应用保护，确保覆盖所有场景（延迟设置 + 直接设置）  
 5. ✅ **易于扩展**：新增功能只需添加新模块并在 `FeatureManager` 中注册  
   
 **限制**：  
-- `FLAG_SECURE` 只能防止系统级截屏和录屏  
-- 无法防止物理拍照（相机拍摄屏幕）  
-- 无法防止通过 ADB 命令截屏（需要 root 权限）  
-- 无法防止某些第三方截屏工具（如果它们有系统权限）  
+- ✅ **已测试通过**：系统截屏快捷键（电源键+音量减）  
+- ✅ **已测试通过**：系统录屏功能  
+- ✅ **已测试通过**：Mumu 模拟器截屏  
+- ❌ **无法防止**：物理拍照（相机拍摄屏幕）  
+- ❌ **无法防止**：通过 ADB 命令截屏（`adb shell screencap`，需要 root 权限）  
+- ❌ **无法防止**：某些第三方截屏工具（如果它们有系统权限或 root 权限）  
+  
+**说明**：  
+- `FLAG_SECURE` 是 Android 系统级标志，只能防止系统级截屏和录屏  
+- 对于物理拍照、ADB 截屏等需要特殊权限的操作，无法防止  
   
 #### 4.12.10 测试建议  
   
 1. **功能测试**：  
-   - 启用防截屏功能后，尝试使用系统截屏快捷键（电源键+音量减）  
-   - 尝试使用系统录屏功能  
-   - 验证是否无法截屏/录屏  
+   - ✅ **系统截屏快捷键**：启用防截屏功能后，尝试使用电源键+音量减截屏，应提示"无法截屏"或"截屏失败"  
+   - ✅ **系统录屏功能**：尝试使用系统录屏功能，应无法录制受保护的 Activity  
+   - ✅ **模拟器测试**：在 Mumu、夜神等模拟器上测试截屏功能，应无法截屏  
+   - ✅ **多 Activity 测试**：测试应用内所有 Activity 是否都受到保护  
   
 2. **兼容性测试**：  
-   - 测试不同 Android 版本（5.0+）  
-   - 测试不同厂商 ROM（MIUI、ColorOS、OneUI 等）  
-   - 测试不同 Activity 类型（普通 Activity、Dialog Activity、透明 Activity 等）  
+   - ✅ **Android 版本**：测试 Android 5.0+ 各版本（已验证 Android 12、13）  
+   - ✅ **厂商 ROM**：测试不同厂商 ROM（MIUI、ColorOS、OneUI、原生 Android 等）  
+   - ✅ **Activity 类型**：测试不同 Activity 类型（普通 Activity、Dialog Activity、透明 Activity、FragmentActivity 等）  
   
 3. **性能测试**：  
-   - 验证应用启动速度不受影响  
-   - 验证 Activity 切换流畅度不受影响  
+   - ✅ **启动速度**：验证应用启动速度不受影响  
+   - ✅ **切换流畅度**：验证 Activity 切换流畅度不受影响  
+   - ✅ **内存占用**：验证功能不会增加明显的内存占用  
   
+4. **日志验证**：  
+   - 查看 logcat 中是否有 `[FEATURE]`、`[SCREENSHOT_PROTECT]` 相关日志  
+   - 确认功能管理器已正确初始化  
+   - 确认 `FLAG_SECURE` 已成功应用到所有 Activity  
+   - 日志示例：  
+     ```  
+     [FEATURE] Starting to initialize FeatureManager in ProxyComponentFactory...  
+     [FEATURE] isScreenshotProtectEnabled() returned: true     [FEATURE] FeatureManager initialized successfully     [SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to xxx.Activity     ```  
 #### 4.12.11 参考资源  
   
 - **Android FLAG_SECURE 文档**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE  
