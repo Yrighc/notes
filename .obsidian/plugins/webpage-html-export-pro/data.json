@@ -10,7 +10,7 @@
     "postProcess": true,
     "displayProgress": true,
     "inlineHTML": false,
-    "exportPath": "",
+    "exportPath": "/Users/yrighc/Downloads",
     "filesToExport": [],
     "useFallbackRenderer": false,
     "addBodyClasses": true,
@@ -307,7 +307,7 @@
     "faviconPath": "",
     "siteName": "notes",
     "iconEmojiStyle": "Native",
-    "exportRoot": "",
+    "exportRoot": "utils",
     "includePluginCss": [],
     "includeStyleCssIds": [],
     "autoDisposeWebpages": true

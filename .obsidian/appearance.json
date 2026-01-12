@@ -1,4 +1,7 @@
 {
   "accentColor": "",
-  "cssTheme": "Minimal"
+  "cssTheme": "Willemstad",
+  "interfaceFontFamily": "LXGW WenKai",
+  "textFontFamily": "LXGW WenKai",
+  "baseFontSize": 16
 }
