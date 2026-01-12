@@ -1,0 +1,23 @@
+{
+  "pluginList": [
+    "Ryanu9/Obsidian_webpage_export_pro"
+  ],
+  "pluginSubListFrozenVersion": [
+    {
+      "repo": "Ryanu9/Obsidian_webpage_export_pro",
+      "version": ""
+    }
+  ],
+  "themesList": [],
+  "updateAtStartup": true,
+  "updateThemesAtStartup": true,
+  "enableAfterInstall": true,
+  "loggingEnabled": false,
+  "loggingPath": "BRAT-log",
+  "loggingVerboseEnabled": false,
+  "debuggingMode": false,
+  "notificationsEnabled": true,
+  "personalAccessToken": "",
+  "selectLatestPluginVersionByDefault": false,
+  "allowIncompatiblePlugins": false
+}
