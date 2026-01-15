@@ -1403,9 +1403,10 @@ public static native boolean isScreenshotProtectEnabled();
    - 确认功能管理器已正确初始化  
    - 确认 `FLAG_SECURE` 已成功应用到所有 Activity  
    - 日志示例：  
-     ```  
+```  
      [FEATURE] Starting to initialize FeatureManager in ProxyComponentFactory...  
-     [FEATURE] isScreenshotProtectEnabled() returned: true     [FEATURE] FeatureManager initialized successfully     [SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to xxx.Activity     ```  
+     [FEATURE] isScreenshotProtectEnabled() returned: true     [FEATURE] FeatureManager initialized successfully     [SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to xxx.Activity     
+```  
 #### 4.12.11 参考资源  
   
 - **Android FLAG_SECURE 文档**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE  
@@ -1427,6 +1428,79 @@ public static native boolean isScreenshotProtectEnabled();
   
 ---  
   
+
+### 4.14 代理检测  
+  
+#### 4.14.1 实现思路  
+  
+代理检测旨在防止中间人攻击（MITM）和流量抓包分析。该功能通过 Native 层和 Java 层双重检测机制，识别常见的代理配置和拦截行为。当检测到代理时，App 会显示安全警告弹窗并强制退出。  
+  
+**检测方式**（综合 Native 和 Java）：  
+1.  **Native Socket 检测** ✅（已实现）：尝试连接特定 IP（1.1.1.1:443）并设置极短超时，检测连接行为异常。  
+2.  **系统属性检测 (Java)** ✅（已实现）：检查 `http.proxyHost` 和 `http.proxyPort` 系统属性。  
+3.  **VPN 状态检测 (Java)** ✅（已实现）：通过 `ConnectivityManager` 检测是否存在 VPN 类型的网络连接。  
+  
+#### 4.14.2 代码结构设计  
+  
+**文件位置**：  
+- `shell/src/main/cpp/dpt_risk.h`：添加函数声明  
+- `shell/src/main/cpp/dpt_risk.cpp`：实现 Native 检测逻辑  
+- `shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java`：实现 Java 检测逻辑及弹窗警告  
+- `shell/src/main/java/com/luoyesiqiu/shell/JniBridge.java`：JNI 接口  
+  
+#### 4.14.3 检测方式详解  
+  
+**方式 1：Native Socket 检测 (透明代理/中间人检测)**  
+原理：在极短的超时时间（300ms）内尝试连接公网 IP（如 1.1.1.1:443）。如果这导致了非预期的连接错误（即非网络不可达、超时等常规错误），则认为可能存在代理或流量拦截。  
+  
+*注意*：为了防止在 Root 设备或防火墙环境下误报，以下错误码会被**忽略**（即视为非代理）：  
+- `ENETUNREACH` (Network is unreachable)  
+- `ETIMEDOUT` (Connection timed out)  
+- `ECONNREFUSED` (Connection refused)  
+- `EHOSTUNREACH` (No route to host)  
+- `EACCES` (Permission denied, 如防火墙拦截)  
+- `EPERM` (Operation not permitted)  
+- `ENETDOWN` (Network is down)  
+- `EINTR` (Interrupted system call)  
+- `EINPROGRESS` (Operation now in progress)  
+- `EALREADY` (Operation already in progress)  
+  
+```cpp  
+// shell/src/main/cpp/dpt_risk.cpp  
+bool detectSocketProxyNative() {  
+    int sock = socket(AF_INET, SOCK_STREAM, 0);    // ... 设置 300ms 超时 ...    int res = connect(sock, ..., sizeof(addr));    int err = errno;    close(sock);  
+    if (res != 0) {        // 忽略常见网络错误，避免误报  
+        if (err == ENETUNREACH || err == ETIMEDOUT || err == EACCES || ...) {            return false;        }        return true; // 其他异常错误视为可疑  
+    }    return false; // 连接成功视为正常  
+}  
+```  
+  
+**方式 2：系统属性检测 (显式代理配置)**  
+原理：读取 Android 系统属性 `http.proxyHost` 和 `http.proxyPort`。如果这两个属性不为空，说明用户在系统设置中配置了 HTTP 代理。  
+  
+```java  
+// ProxyComponentFactory.java  
+private static boolean checkSystemProxy() {  
+    String host = System.getProperty("http.proxyHost");    String port = System.getProperty("http.proxyPort");    return !TextUtils.isEmpty(host) && !TextUtils.isEmpty(port);}  
+```  
+  
+**方式 3：VPN 状态检测**  
+原理：使用 `ConnectivityManager` 检查当前激活的网络是否包含 `TRANSPORT_VPN` 能力。这可以检测到 VPN 应用（如抓包工具常见的 VPN 模式）。  
+  
+```java  
+// ProxyComponentFactory.java  
+private static boolean checkVpn() {  
+    ConnectivityManager cm = ...;    Network activeNetwork = cm.getActiveNetwork();    NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);    return caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN);}  
+```  
+  
+#### 4.14.4 警告与退出机制  
+  
+当检测到代理（任何一种方式命中）时，系统会触发警告流程：  
+1.  **UI 弹窗**：在当前最顶层的 Activity 显示不可取消的警告对话框。  
+2.  **强制退出**：用户点击“确定”或对话框显示后，应用会清除任务栈、杀掉进程并调用 `System.exit(0)`。  
+3.  **冲突处理**：如果 Root 检测已经触发了警告，代理检测的警告将被抑制，优先显示 Root 警告。  
+  
+
 ## 五、关键技术点总结  
   
 ### 5.1 Hook 框架  
@@ -1447,6 +1521,7 @@ public static native boolean isScreenshotProtectEnabled();
 - 不同版本 ART 结构体不同，需要适配  
   
 ---  
+  
   
 ## 六、参考资料  
   
