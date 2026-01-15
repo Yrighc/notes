@@ -242,9 +242,7 @@ File[] files = keepDexTempDir.listFiles();
   
 // 将保留的 DEX 文件添加到 DEX 目录  
 for (File file : files) {  
-    if (file.getName().endsWith(".dex")) {  
-        addDex(file.getAbsolutePath(), getDexDir(packageDir));  
-    }}  
+    if (file.getName().endsWith(".dex")) {        addDex(file.getAbsolutePath(), getDexDir(packageDir));    }}  
 ```  
   
 **目的**：  
@@ -1248,7 +1246,7 @@ public class FeatureManager {
 ```  
   
 **防截屏功能模块**：  
-```java
+```java  
 // shell/src/main/java/com/luoyesiqiu/shell/feature/ScreenshotProtectFeature.java  
 public class ScreenshotProtectFeature {  
     private static volatile boolean sEnabled = false;  
