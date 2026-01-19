@@ -286,7 +286,8 @@ memcpy(insns, codeItem->getInsns(), codeItem->getInsnsSize());}  ```
 2. **运行时检测**：  
 ```cpp  // 检测垃圾类是否被非法调用  if(descriptor 包含 junkClassName) {    char ch = descriptor[descriptorLength - 2];    if(isdigit(ch)) {  // 如果类名包含数字（说明被调用）    
 dpt_crash();  // 崩溃    
-}}  ```    
+}}  
+```    
 ### 3.4 SO 文件加密  
   
 **实现位置**：  
@@ -307,7 +308,8 @@ Dl_info info;    dladdr((void*)decrypt_bitcode, &info);    // 2. 读取 .bitcode
 Elf_Shdr shdr;    get_elf_section(&shdr, so_path, ".bitcode");    // 3. 修改内存权限为可写    
 dpt_mprotect(target, target + size, PROT_READ | PROT_WRITE | PROT_EXEC);    // 4. RC4 解密    
 rc4_init(&dec_state, key, 16);    rc4_crypt(&dec_state, target, bitcode, size);    memcpy(target, bitcode, size);    // 5. 恢复内存权限    
-dpt_mprotect(target, target + size, PROT_READ | PROT_EXEC);}  ```    
+dpt_mprotect(target, target + size, PROT_READ | PROT_EXEC);}  
+```    
 ### 3.5 Frida 检测  
   
 **实现位置**：`shell/src/main/cpp/dpt_risk.cpp`  
@@ -317,7 +319,8 @@ dpt_mprotect(target, target + size, PROT_READ | PROT_EXEC);}  ```
 while (true) {        // 1. 检测 Frida SO 文件    
 int frida_so_count = find_in_maps(1, "frida-agent");        if(frida_so_count > 0) {            dpt_crash();        }        // 2. 检测 Frida 线程    
         int frida_thread_count = find_in_threads_list(4,            "pool-frida", "gmain", "gbus", "gum-js-loop");        if(frida_thread_count >= 2) {            dpt_crash();        }                sleep(10);    
-}}  ```    
+}}  
+```    
 ### 3.6 子进程反调试  
   
 **实现位置**：`shell/src/main/cpp/dpt_risk.cpp`  
@@ -329,7 +332,8 @@ pid_t child = fork();    if(child == 0) {        // 子进程：检测 Frida + p
     
 void* protectProcessOnThread(void* args) {    
 pid_t child = *((pid_t*)args);    int pid = waitpid(child, nullptr, 0);    if(pid > 0) {  // 子进程被调试器 attach 会退出    
-dpt_crash();    }}  ```    
+dpt_crash();    }}  
+```    
 ### 3.7 execve Hook（阻止 dex2oat）  
   
 **实现位置**：`shell/src/main/cpp/dpt_hook.cpp`  
@@ -337,7 +341,8 @@ dpt_crash();    }}  ```
 **实现原理**：  
 ```cpp  int fake_execve(const char *pathname, char *const argv[], char *const envp[]) {    
 if (strstr(pathname, "dex2oat") != nullptr) {        errno = EACCES;        return -1;  // 阻止 dex2oat 执行    
-}    return BYTEHOOK_CALL_PREV(fake_execve, pathname, argv, envp);}  ```    
+}    return BYTEHOOK_CALL_PREV(fake_execve, pathname, argv, envp);}  
+```    
 ### 3.8 字符串混淆  
   
 **实现位置**：`shell/src/main/cpp/common/obfuscate.h`  
@@ -355,7 +360,8 @@ if (strstr(pathname, "dex2oat") != nullptr) {        errno = EACCES;        retu
 ```cpp  void* fake_mmap(void* __addr, size_t __size, int __prot, int __flags, int __fd, off_t __offset) {    
     int hasRead = (__prot & PROT_READ) == PROT_READ;    int hasWrite = (__prot & PROT_WRITE) == PROT_WRITE;        if(hasRead && !hasWrite) {    
 prot = prot | PROT_WRITE;  // 添加写权限    
-}        return BYTEHOOK_CALL_PREV(fake_mmap, __addr, __size, prot, __flags, __fd, __offset);  }  ```    
+}        return BYTEHOOK_CALL_PREV(fake_mmap, __addr, __size, prot, __flags, __fd, __offset);  }  
+```    
     
 ---    
 ## 四、未实现功能的实现思路  
@@ -384,7 +390,8 @@ SHA256_CTX ctx;    SHA256_Init(&ctx);    // 读取文件并计算哈希
     return hash;}    
     
 // 运行时校验  void verifyIntegrity() {    
-std::string currentHash = calculateHash(dexPath);    if(currentHash != expectedHash) {        dpt_crash();    }}  ```    
+std::string currentHash = calculateHash(dexPath);    if(currentHash != expectedHash) {        dpt_crash();    }}  
+```    
 **参考资料**：  
 - Android 文件完整性校验：https://developer.android.com/training/articles/security-config  
   
@@ -418,7 +425,8 @@ ROOT 检测应该采用**多层次、多方式**的综合检测策略，参考�
 **函数设计**：  
 ```cpp  // dpt_risk.h  void detectRoot();  // 启动 ROOT 检测    
     
-// dpt_risk.cpp  bool isRooted();  // 检测设备是否已 ROOTvoid* detectRootOnThread(void* args);  // 后台检测线程  ```    
+// dpt_risk.cpp  bool isRooted();  // 检测设备是否已 ROOTvoid* detectRootOnThread(void* args);  // 后台检测线程  
+```    
 #### 4.3.3 检测方式详解  
   
 **方式 1：检测 su 文件路径**  
@@ -426,10 +434,12 @@ ROOT 检测应该采用**多层次、多方式**的综合检测策略，参考�
     "/system/bin/su",    "/system/xbin/su",    "/sbin/su",    "/vendor/bin/su",    "/data/local/su",    "/data/local/bin/su",    "/data/local/xbin/su",    "/system/sbin/su",    "/system/bin/failsafe/su",    "/system/xbin/daemonsu",    "/system/etc/init.d/99SuperSUDaemon",    "/dev/com.koushikdutta.superuser.daemon/",    "/system/app/Superuser.apk",    "/system/app/SuperSU.apk",    nullptr};    
     
 for (int i = 0; su_paths[i] != nullptr; i++) {    
-if (access(su_paths[i], F_OK) == 0) {        return true;    }}  ```    
+if (access(su_paths[i], F_OK) == 0) {        return true;    }}  
+```    
 **方式 2：检测 Magisk 相关文件**  
 ```cpp  const char *magisk_paths[] = {    
-"/sbin/magisk",    "/system/bin/magisk",    "/system/xbin/magisk",    "/data/adb/magisk",    "/cache/magisk.log",    "/data/adb/magisk.db",    "/data/adb/modules",    nullptr};  ```    
+"/sbin/magisk",    "/system/bin/magisk",    "/system/xbin/magisk",    "/data/adb/magisk",    "/cache/magisk.log",    "/data/adb/magisk.db",    "/data/adb/modules",    nullptr};  
+```    
 **方式 3：检测系统属性**  
 ```cpp  char prop_value[256] = {0};    
     
@@ -441,7 +451,8 @@ if (strcmp(prop_value, "1") == 0) {        // 注意：仅 ro.debuggable=1 不�
     }}    
     
 // 检测 ro.secure（安全模式）  prop_value[0] = '\0';  if (__system_property_get("ro.secure", prop_value) > 0) {    
-if (strcmp(prop_value, "0") == 0) {        return true;  // ro.secure=0 通常表示已 ROOT    }}  ```    
+if (strcmp(prop_value, "0") == 0) {        return true;  // ro.secure=0 通常表示已 ROOT    }}  
+```    
 **方式 4：检测 root 管理应用数据目录（包括 KernelSU）**  
 ```cpp  const char *root_app_paths[] = {    
 "/data/data/com.noshufou.android.su",    "/data/data/com.thirdparty.superuser",    "/data/data/eu.chainfire.supersu",    "/data/data/com.topjohnwu.magisk",    "/data/data/com.kingroot.kinguser",    "/data/data/com.kingo.root",    "/data/data/com.smedialink.oneclickroot",    "/data/data/com.zhiqupk.root.global",    "/data/data/com.alephzain.framaroot",    "/data/data/com.devadvance.rootcloak",    "/data/data/com.devadvance.rootcloakplus",    // KernelSU 相关应用    
