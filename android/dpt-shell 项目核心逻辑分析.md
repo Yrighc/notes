@@ -1,1296 +1,1861 @@
-# dpt-shell 项目核心逻辑分析  
-  
-## 一、项目整体架构  
-  
-dpt-shell 是一个 Android DEX 函数抽取壳，采用"编译时抽取 + 运行时填回"的机制。  
-  
-### 模块划分  
-- **dpt 模块**：Java 命令行工具，负责处理 APK/AAB，生成加壳后的安装包  
-- **shell 模块**：Android 应用模块（Java + C++），负责运行时保护和解密  
-  
----    
-## 二、核心流程  
-  
-### 2.1 编译时处理流程（dpt 模块）  
-  
-```  输入 APK/AAB    ↓1. 解压 APK，提取所有 DEX 文件    
-↓2. 遍历每个 DEX 文件的所有类和方法    
-↓3. 提取方法体（CodeItem）：    
-- 读取方法的 insns（指令数组）    
-- 保存原始字节码    
-- 将方法体替换为 return 语句（或随机指令混淆）    
-↓4. 将所有 CodeItem 加密存储到 zip 文件    
-↓5. 修改 AndroidManifest.xml：    
-- 备份原 Application 类名    
-- 替换为 ProxyApplication    ↓6. 集成 shell 模块：    
-- 将 shell 的 DEX 和 SO 文件添加到 APK   - 将 CodeItem 文件添加到 assets   - 将加密的 shell 配置文件（包含 root_detect、screenshot_protect 等配置）添加到 assets    ↓7. 生成垃圾代码 DEX（可选）    
-↓8. 打包、对齐、签名    
-    ↓输出加壳 APK```    
-### 2.2 运行时执行流程（shell 模块）    
-    
-```  App 启动  ↓1. ProxyApplication.attachBaseContext()  
-- 解压 shell SO 文件到 dataDir   - 加载 shell SO（System.load）  
-- 调用 JniBridge.ia() 初始化    
-↓2. SO 加载时（JNI_OnLoad）  
-- read_shell_config() 读取加密配置文件（包含 root_detect、screenshot_protect 等配置）  
-- 注册 JNI 方法（包括 isRootDetectEnabled、isScreenshotProtectEnabled）  
-- 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）    
-↓3. SO 加载时（.init_array）  
-- init_dpt() 执行：  
-  * 解密 .bitcode 段（如果启用）  
-  * dpt_hook() 进行 Hook    ↓4. Hook 关键函数：  
-- hook_mmap()：使 DEX 内存可写  
-- hook_DefineClass()：拦截类加载  
-- hook_execve()：阻止 dex2oat    ↓5. createAntiRiskProcess() 执行（延迟线程中）：  
-- 根据 root_detect 配置决定是否执行 ROOT 检测  
-- fork() 子进程进行反调试检测  
-- 主进程：监控子进程 + 检测 Frida + ROOT（如果启用）  
-- 子进程：ptrace 反调试 + ROOT（如果启用）    
-↓6. JniBridge.ia() 执行：  
-- 从 APK 中读取 CodeItem 文件  
-- 解析并加载到内存（dexMap）  
-- 提取 DEX 文件到 dataDir    ↓7. combineDexElements()：  
-- 将提取的 DEX 合并到 ClassLoader   - 优先从壳的 DEX 查找类    
-↓8. 类加载时（DefineClass Hook）：  
-- 检测到类被加载  
-- 遍历类的所有方法  
-- 从 dexMap 查找对应的 CodeItem   - 将 CodeItem 写回方法体位置    
-↓9. ProxyApplication.onCreate()：  
-- 初始化功能管理器（FeatureManager.initialize()）  
-  * 根据配置启用/禁用 ROOT 检测和防截屏功能  
-- 注册 ActivityLifecycleCallbacks     * onActivityCreated() → 应用防截屏保护（第一重）  
-  * onActivityResumed() → 应用防截屏保护（第二重，双重保险）  
-- 调用原 Application.onCreate()   - 应用正常启动  
-```    
-    
----    
-    
-## 2.3 DEX 处理详细流程    
-    
-在编译时处理阶段，DEX 文件会经过以下 7 个关键步骤的处理：    
-    
-### 步骤 1：extractDexCode - 提取 DEX 代码到资源目录    
-    
-**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::extractDexCode()`    
-    
-**处理过程**：  ```java  // 1. 遍历所有 DEX 文件（classes.dex, classes2.dex...）  List<File> dexFiles = getDexFiles(getDexDir(packageDir));    
-    
-// 2. 如果需要保留部分类，先分割 DEXif (isKeepClasses()) {// 将 DEX 分为两部分：    
-// - keepDex: 保留在 APK 中的类（匹配排除规则）    
-// - splitDex: 需要保护的类（抽取代码）    
-    DexUtils.splitDex(dexFile, keepDex, splitDex);}    
-    
-// 3. 提取所有方法的 CodeItem（字节码）  List<Instruction> ret = DexUtils.extractAllMethods(    
-dexFile, extractedDexFile, packageName, dumpCode, obfuscate);  // 4. 将提取的代码保存到 assets 目录  // 文件：assets/classes.dex.dat（MultiDexCode 格式）  MultiDexCodeUtils.writeMultiDexCode(dataOutputPath, multiDexCode);  ```    
-**目的**：  
-- **抽取方法字节码**：将方法体替换为 return 语句或随机指令  
-- **保存到 assets**：运行时从 assets 读取并填回  
-- **隐藏真实代码**：APK 中不再包含原始字节码  
-  
-**结果**：  
-- 原 DEX 文件：方法体被替换（空壳）  
-- `assets/classes.dex.dat`：包含所有 CodeItem 数据  
-  
----    
-### 步骤 2：addJunkCodeDex - 添加垃圾代码 DEX  
-  
-**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::addJunkCodeDex()`  
-  
-**处理过程**：  
-```java  // 将 junkcode.dex 添加到 DEX 目录  addDex(getJunkCodeDexPath(), getDexDir(packageDir));  // 例如：classes.dex, classes2.dex, junkcode.dex    
-```    
-**目的**：  
-- **反调试**：垃圾代码类包含检测逻辑  
-- **混淆**：增加分析难度  
-- **运行时检测**：在类加载时触发反调试检查  
-  
-**结果**：  
-- DEX 目录中新增 `junkcode.dex`（包含垃圾代码类）  
-  
----    
-### 步骤 3：compressDexFiles - 压缩 DEX 文件  
-  
-**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::compressDexFiles()`  
-  
-**处理过程**：  
-```java  // 1. 将所有 DEX 文件压缩成 ZIP（STORE 模式，不压缩）  Map<String, CompressionMethod> rulesMap = new HashMap<>();  rulesMap.put("classes\\d*.dex", CompressionMethod.STORE);  ZipUtils.compress(getDexFiles(getDexDir(packageDir)),     
-                  unalignedFilePath, rulesMap);    
-    
-// 2. 执行 zipalign 对齐（优化内存映射）  ZipAlign.alignZip(randomAccessFile, out);    
-    
-// 3. 保存到 assets 目录  // 文件：assets/classes.dex.zip    
-```    
-**目的**：  
-- **隐藏 DEX**：压缩后不易被直接提取  
-- **对齐优化**：zipalign 提升加载性能  
-- **统一管理**：多个 DEX 合并为一个 ZIP  
-  
-**结果**：  
-- `assets/classes.dex.zip`：包含所有 DEX 文件（压缩包）  
-  
----    
-### 步骤 4：deleteAllDexFiles - 删除所有 DEX 文件  
-  
-**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::deleteAllDexFiles()`  
-  
-**处理过程**：  
-```java  List<File> dexFiles = getDexFiles(getDexDir(packageDir));  for (File dexFile : dexFiles) {    
-dexFile.delete();  // 删除所有 .dex 文件  }    
-```    
-**目的**：  
-- **清理**：删除已处理的 DEX（代码已抽取）  
-- **防止泄露**：避免原始 DEX 残留在 APK 中  
-- **准备合并**：为后续合并壳 DEX 做准备  
-  
-**结果**：  
-- DEX 目录清空（所有 .dex 文件已删除）  
-  
----    
-### 步骤 5：combineDexZipWithShellDex - 将壳 DEX 与原 DEX 合并  
-  
-**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::combineDexZipWithShellDex()`  
-  
-**处理过程**：  
-```java  // 1. 读取壳 DEX（ProxyApplication 等）  byte[] shellDex = readFile(getProxyDexPath());    
-    
-// 2. 读取压缩的 DEX ZIPbyte[] zipData = readFile(originalDexZipFile);  // assets/classes.dex.zip    
-// 3. 合并：壳 DEX + ZIP 数据 + ZIP 长度（4字节）  byte[] newDexBytes = new byte[shellDexLen + zipDataLen + 4];  System.arraycopy(shellDex, 0, newDexBytes, 0, shellDexLen);  System.arraycopy(zipData, 0, newDexBytes, shellDexLen, zipDataLen);  System.arraycopy(intToByte(zipDataLen), 0, newDexBytes, totalLen-4, 4);    
-    
-// 4. 修复 DEX 头部（file_size, SHA1, CheckSum）  FileUtils.fixFileSizeHeader(newDexBytes);  FileUtils.fixSHA1Header(newDexBytes);  FileUtils.fixCheckSumHeader(newDexBytes);    
-    
-// 5. 生成新的 classes.dexwriteFile(targetDexFile, newDexBytes);    
-```    
-**目的**：  
-- **隐藏 ZIP**：将 ZIP 数据嵌入 DEX 尾部  
-- **伪装**：看起来是普通 DEX，实际包含压缩包  
-- **运行时提取**：从 DEX 尾部读取 ZIP 长度，提取压缩包  
-  
-**文件结构**：  
-```  新的 classes.dex:┌─────────────────┐  │   壳 DEX 代码    │  ProxyApplication, JniBridge 等  ├─────────────────┤  │   ZIP 数据      │  classes.dex.zip（原 DEX 文件）  ├─────────────────┤  │   ZIP 长度(4B)  │  用于运行时定位 ZIP 起始位置  └─────────────────┘  ```    
-**运行时提取**（`shell/src/main/cpp/dpt_util.cpp`）：  
-```cpp  // shell 运行时从 DEX 文件末尾读取 ZIP 长度  uint32_t zipLen = *(uint32_t*)(dexEnd - 4);  uint8_t* zipData = dexBegin + (dexSize - zipLen - 4);  // 解压 ZIP 得到原始 DEX 文件  ```    
-    
----    
-### 步骤 6：addKeepDexes - 添加保留 DEX 文件  
-  
-**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::addKeepDexes()`  
-  
-**处理过程**：  
-```java  File keepDexTempDir = getKeepDexTempDir(packageDir);  File[] files = keepDexTempDir.listFiles();    
-    
-// 将保留的 DEX 文件添加到 DEX 目录  for (File file : files) {    
-if (file.getName().endsWith(".dex")) {        addDex(file.getAbsolutePath(), getDexDir(packageDir));    }}    
-```    
-**目的**：  
-- **保留部分类**：匹配排除规则的类保留在原始 DEX 中  
-- **兼容性**：某些类需要直接可见（如系统组件）  
-- **性能**：减少运行时填回的工作量  
-  
-**结果**：  
-- 如果启用了 `keepClasses`，会添加 `classes2.dex`、`classes3.dex` 等保留的 DEX  
-  
----    
-### 步骤 7：删除临时保留 DEX 目录  
-  
-**处理过程**：  
-```java  FileUtils.deleteRecurse(apk.getKeepDexTempDir(apkMainProcessPath));    
-```    
-**目的**：  
-- **清理临时文件**：删除处理过程中的临时目录  
-  
----    
-### DEX 处理流程总结  
-  
-```  原始 APK:├── classes.dex          (原始代码)  ├── classes2.dex         (原始代码)  └── ...    
-    
-步骤 1: extractDexCode├── classes.dex          (代码已抽取，方法体为空)  ├── classes2.dex         (代码已抽取，方法体为空)  └── assets/    
-└── classes.dex.dat  (CodeItem 数据)    
-    
-步骤 2: addJunkCodeDex├── classes.dex          (代码已抽取)  ├── classes2.dex         (代码已抽取)  └── junkcode.dex         (垃圾代码)    
-    
-步骤 3: compressDexFiles├── classes.dex          (代码已抽取)  ├── classes2.dex         (代码已抽取)  ├── junkcode.dex         (垃圾代码)  └── assets/    
-├── classes.dex.dat  (CodeItem 数据)    
-    └── classes.dex.zip  (压缩的 DEX 文件)    
-    
-步骤 4: deleteAllDexFiles└── assets/├── classes.dex.dat  (CodeItem 数据)    
-    └── classes.dex.zip  (压缩的 DEX 文件)    
-    
-步骤 5: combineDexZipWithShellDex├── classes.dex          (壳 DEX + ZIP 数据)  └── assets/    
-├── classes.dex.dat  (CodeItem 数据)    
-    └── classes.dex.zip  (已删除)    
-    
-步骤 6: addKeepDexes (如果启用)  ├── classes.dex          (壳 DEX + ZIP 数据)  ├── classes2.dex         (保留的类，如果启用 keepClasses)└── assets/└── classes.dex.dat  (CodeItem 数据)  ```    
-### 为什么这样做？  
-  
-1. **代码隐藏**：原始字节码不在 APK 的 DEX 中，运行时动态填回，静态分析无法直接看到  
-2. **混淆**：方法体被替换，增加逆向难度；垃圾代码增加干扰  
-3. **保护**：ZIP 嵌入 DEX，隐藏压缩包；运行时从内存中提取，不落盘  
-4. **兼容性**：保留部分类，确保系统组件正常工作；支持 MultiDex  
-5. **性能**：zipalign 对齐优化加载；按需填回，减少内存占用  
-  
----    
-## 三、已实现功能的实现方式  
-  
-### 3.1 三代代码分离保护（核心功能）  
-  
-**实现位置**：  
-- `dpt/src/main/java/com/luoye/dpt/util/DexUtils.java`  
-- `shell/src/main/cpp/dpt_hook.cpp`  
-  
-**实现原理**：  
-  
-1. **编译时抽取**（DexUtils.extractMethod）：  
-```java  // 1. 读取方法的 CodeItemCode code = dex.readCode(method);  int insnsOffset = method.getCodeOffset() + 16; // CodeItem 头部 16 字节    
-    
-// 2. 保存原始指令  byte[] byteCode = new byte[insnsCapacity * 2];  for (int i = 0; i < insnsCapacity; i++) {    
-    byteCode[i * 2] = outRandomAccessFile.readByte();    byteCode[i * 2 + 1] = outRandomAccessFile.readByte();}    
-    
-// 3. 替换为 return 语句或随机指令  if(obfuscateIns) {    
-outRandomAccessFile.writeShort(insRandom.nextInt()); // 随机指令  } else {    
-outRandomAccessFile.writeShort(0x0e); // nop 指令  }  outRandomAccessFile.write(returnByteCodes); // 写入 return    
-```    
-2. **运行时填回**（dpt_hook.cpp::patchMethod）：  
-```cpp  // 1. Hook DefineClass，拦截类加载  void* DefineClassV22(...) {    
-    patchClass(descriptor, dex_file, dex_class_def);    return g_originDefineClassV22(...);}    
-    
-// 2. 遍历类的所有方法  for (uint64_t i = 0; i < direct_methods_size; i++) {    
-    auto method = directMethods[i];    patchMethod(begin, location.c_str(), dexSize, dexIndex,                method.method_idx_delta_, method.code_off_);}    
-    
-// 3. 从内存中查找 CodeItem 并写回  void patchMethod(...) {    
-// 计算 method_idx    uint32_t methodIdx = ...;    // 从 dexMap 查找    
-auto codeItemVec = dexMap[dexIndex];    data::CodeItem *codeItem = codeItemVec->at(methodIdx);    // 计算 insns 位置    
-uint8_t *insns = begin + code_off + 16;    // 写回字节码    
-memcpy(insns, codeItem->getInsns(), codeItem->getInsnsSize());}  ```    
-### 3.2 指令混淆  
-  
-**实现位置**：`DexUtils.extractMethod()`  
-  
-**实现原理**：  
-- 默认模式：用 `0x0e` (nop) 填充  
-- 混淆模式：用随机数填充（`insRandom.nextInt()`）  
-- 增加逆向分析难度  
-  
-### 3.3 垃圾代码生成与保护  
-  
-**实现位置**：  
-- `dpt/src/main/java/com/luoye/dpt/dex/JunkCodeGenerator.java`  
-- `shell/src/main/cpp/dpt_hook.cpp::patchClass()`  
-  
-**实现原理**：  
-  
-1. **生成垃圾类**：  
-```java  // 生成 50-100 个垃圾类  for(int i = 0; i < generateClassCount; i++) {    
-// 每个类包含：    
-    // - <clinit>：调用 System.exit(0)    // - <init>：调用 System.exit(0)    // - 随机方法：System.exit(0) 或抛出 NullPointerException}    
-```    
-2. **运行时检测**：  
-```cpp  // 检测垃圾类是否被非法调用  if(descriptor 包含 junkClassName) {    char ch = descriptor[descriptorLength - 2];    if(isdigit(ch)) {  // 如果类名包含数字（说明被调用）    
-dpt_crash();  // 崩溃    
-}}  ```    
-### 3.4 SO 文件加密  
-  
-**实现位置**：  
-- `dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::encryptSoFile()`  
-- `shell/src/main/cpp/dpt.cpp::decrypt_bitcode()`  
-  
-**实现原理**：  
-  
-1. **编译时加密**：  
-```java  // 读取 .bitcode 段  ReadElf readElf = new ReadElf(soFile);  List<SectionHeader> sections = readElf.getSectionHeaders();  for (SectionHeader section : sections) {    
-if (".bitcode".equals(section.getName())) {        byte[] bitcode = IoUtils.readFile(soFile, section.getOffset(), section.getSize());        byte[] enc = CryptoUtils.rc4Crypt(rc4Key, bitcode);  // RC4 加密    
-IoUtils.writeFile(soFile, enc, section.getOffset());    }}    
-```    
-2. **运行时解密**：  
-```cpp  // 在 .init_array 中解密  void decrypt_bitcode() {    
-// 1. 获取 SO 文件路径    
-Dl_info info;    dladdr((void*)decrypt_bitcode, &info);    // 2. 读取 .bitcode 段    
-Elf_Shdr shdr;    get_elf_section(&shdr, so_path, ".bitcode");    // 3. 修改内存权限为可写    
-dpt_mprotect(target, target + size, PROT_READ | PROT_WRITE | PROT_EXEC);    // 4. RC4 解密    
-rc4_init(&dec_state, key, 16);    rc4_crypt(&dec_state, target, bitcode, size);    memcpy(target, bitcode, size);    // 5. 恢复内存权限    
-dpt_mprotect(target, target + size, PROT_READ | PROT_EXEC);}  ```    
-### 3.5 全方位 Hook 与注入防御体系 (Omni-Hook Protection)  
-  
-**实现位置**：`shell/src/main/cpp/dpt_risk.cpp`  
-  
-**核心架构**：  
-采用 **"双进程守护 + 多特征扫描 + 瞬时阻断"** 的立体防御架构。我们不仅仅拦截 Frida，而是实现了一个针对主流 Hook 框架、注入技术和调试器的全谱系防御网。  
-  
-#### 3.5.0 防御覆盖范围 (Coverage Matrix)  
-  
-**1. 动态注入框架 (Dynamic Instrumentation)**  
-  
-| 框架 | 检测方式 | 覆盖情况 |  
-| :--- | :--- | :--- |  
-| **Frida** | 线程名 (`gum-js-loop`, `pool-frida`) + SO 库 (`frida-agent.so`) | ✅ **已覆盖 (秒级强杀)** |  
-| **Xposed** | 文件路径 (`XposedBridge.jar`) + 内存 Maps + 调用栈符号 (`de.robv.android.xposed`) | ✅ **已覆盖 (强杀)** |  
-| **EdXposed** | 文件路径 (`libedxposed.so`) + 调用栈符号 | ✅ **已覆盖 (强杀)** |  
-| **LSPosed** | 文件路径 (`lspd`, `modules`) + 调用栈符号 (`LspHooker`) | ✅ **已覆盖 (强杀)** |  
-| **Cydia Substrate** | 文件路径 (`libsubstrate.so`) + 内存 Maps | ✅ **已覆盖 (强杀)** |  
-  
-**2. 注入式 Hook (Injection Hook)**  
-  
-| 框架 | 检测方式 | 覆盖情况 |  
-| :--- | :--- | :--- |  
-| **Riru** | 文件/内存特征 (`libriru.so`, `/data/misc/riru`) | ✅ **已覆盖 (强杀)** |  
-| **Zygisk** | 间接覆盖 (通过检测其加载的模块如 LSPosed/Frida，本身特征较隐蔽) | ⚠️ 部分覆盖 |  
-| **SandHook** | 符号检测 (`sandhook`) + 指令特征 | ✅ **已覆盖 (强杀)** |  
-  
-**3. Native Inline Hook**  
-  
-| 攻击方式 | 检测方式 | 覆盖情况 |  
-| :--- | :--- | :--- |  
-| **GOT Hook** | 未专门实现 (通常被当作 Inline Hook 或完整性校验的一部分) | ❌ 未覆盖 |  
-| **Inline Hook** | 扫描 `libc` 关键函数 (`open`, `read`, `dlsym` 等) 的前 8 字节是否为跳转指令 (`B`, `LDR`, `BR`) | ✅ **已覆盖 (强杀)** |  
-  
-**4. 调试器 (Debugger)**  
-  
-| 工具 | 检测方式 | 覆盖情况 |  
-| :--- | :--- | :--- |  
-| **IDA Pro / GDB** | `ptrace` (双进程守护 + `PTRACE_TRACEME` 占坑) + 父子进程互相监控 | ✅ **已覆盖 (强杀)** |  
-  
-#### 3.5.1 整体防御流程  
-1.  **启动阶段 (JNI_OnLoad)**：读取加密配置，注册 JNI 方法 (修复了方法签名缺失的隐患)，启动延迟线程。  
-2.  **进程分裂 (Dual-Process)**：延迟调用 `createAntiRiskProcess()`，执行 `fork()`。  
-    *   **主进程**：运行核心检测逻辑 (Maps/Threads/Root)，同时监控子进程存活。  
-    *   **子进程**：执行 `ptrace(PTRACE_TRACEME)` 抢占调试端口，防止 Frida/IDA 附加；同时作为冗余检测节点。  
-3.  **循环扫描**：每 1 秒执行一次全量特征扫描。  
-4.  **异常处置**：一旦命中特征，直接调用 `dpt_crash()` (SIGKILL) 强杀进程，不给攻击者任何反应窗口。  
-  
-  
-#### 3.5.1 整体防御流程  
-1.  **启动阶段 (JNI_OnLoad)**：读取加密配置，注册 JNI 方法 (修复了方法签名缺失的隐患)，启动延迟线程。  
-2.  **进程分裂 (Dual-Process)**：延迟调用 `createAntiRiskProcess()`，执行 `fork()`。  
-    *   **主进程**：运行核心检测逻辑 (Maps/Threads/Root)，同时监控子进程存活。  
-    *   **子进程**：执行 `ptrace(PTRACE_TRACEME)` 抢占调试端口，防止 Frida/IDA 附加；同时作为冗余检测节点。  
-3.  **循环扫描**：每 1 秒执行一次全量特征扫描。  
-4.  **异常处置**：一旦命中特征，直接调用 `dpt_crash()` (SIGKILL) 强杀进程，不给攻击者任何反应窗口。  
-  
-#### 3.5.2 Frida 专项检测 (In-Process Detection)  
-**检测函数**：`detectFridaOnThread`  
-**扫描频率**：1s/次 (高危防护)  
-  
-1.  **内存映射扫描 (Maps Detection)**：  
-    *   读取 `/proc/self/maps`，查找 `frida-agent*.so` 等特征动态库。  
-    *   **关键改进**：缓冲区已扩容至 **2048 字节**，解决了 Uniapp 等框架产生的超长文件路径导致的读取截断/溢出问题。  
-2.  **线程特征扫描 (Thread Detection)**：  
-    *   遍历 `/proc/self/task`，检查所有线程名称。  
-    *   黑名单：`gum-js-loop`, `gmain`, `gdbus`, `pool-frida`。  
-    *   逻辑：如果发现上述特征线程数量 >= 2，立即判定为 Frida 注入。  
-  
-#### 3.5.3 Xposed 与 Hook 框架检测  
-**检测函数**：`detectHookFramework`  
-  
-1.  **类栈扫描**：检查 Java 调用栈中是否存在 `de.robv.android.xposed.XposedBridge` 或 `ed.hook` 等特征类。  
-2.  **Native 桥检测**：检查 `XposedBridge` 的 native 方法是否被注册。  
-3.  **Map 检测**：扫描 maps 中是否存在 `XposedBridge.jar` 或相关 odex 文件。  
-  
-#### 3.5.4 Inline Hook 检测  
-**检测函数**：`detectInlineHook` (部分实现)  
-  
-*   **原理**：扫描常见系统函数（如 `libc.so` 中的 `open`, `read`, `mmap` 等）的函数头前几个字节。  
-*   **特征**：检查是否被修改为跳转指令 (比如 ARM 的 `LDR PC, ...` 或 Thumb 的 `B ...`)。如果函数头被篡改，说明存在挂钩。  
-  
-#### 3.5.5 反调试占坑 (Anti-Debug)  
-**实现函数**：`doPtrace` (运行于子进程)  
-  
-```cpp  
-void doPtrace() {  
-    // 抢占 PTRACE_TRACEME，利用 Linux 内核 "同一时间只能有一个调试器" 的特性  
-    // 导致 Frida -f 或 gdb 无法再 attach 上去  
-    ptrace(PTRACE_TRACEME, 0, 0, 0);}  
+# dpt-shell 项目核心逻辑分析
+
+## 一、项目整体架构
+
+dpt-shell 是一个 Android DEX 函数抽取壳，采用"编译时抽取 + 运行时填回"的机制。
+
+### 模块划分
+- **dpt 模块**：Java 命令行工具，负责处理 APK/AAB，生成加壳后的安装包
+- **shell 模块**：Android 应用模块（Java + C++），负责运行时保护和解密
+
+---
+
+## 二、核心流程
+
+### 2.1 编译时处理流程（dpt 模块）
+
+```  
+输入 APK/AAB    ↓1. 解压 APK，提取所有 DEX 文件  
+    ↓2. 遍历每个 DEX 文件的所有类和方法  
+    ↓3. 提取方法体（CodeItem）：  
+   - 读取方法的 insns（指令数组）  
+   - 保存原始字节码  
+   - 将方法体替换为 return 语句（或随机指令混淆）  
+    ↓4. 将所有 CodeItem 加密存储到 zip 文件  
+    ↓5. 修改 AndroidManifest.xml：  
+   - 备份原 Application 类名  
+   - 替换为 ProxyApplication    ↓6. 集成 shell 模块：  
+   - 将 shell 的 DEX 和 SO 文件添加到 APK   - 将 CodeItem 文件添加到 assets   - 将加密的 shell 配置文件（包含 root_detect、screenshot_protect 等配置）添加到 assets    ↓7. 生成垃圾代码 DEX（可选）  
+    ↓8. 打包、对齐、签名  
+    ↓输出加壳 APK```  
+  
+### 2.2 运行时执行流程（shell 模块）  
+  
+```
+App 启动  
+↓1. ProxyApplication.attachBaseContext()
+- 解压 shell SO 文件到 dataDir   - 加载 shell SO（System.load）
+- 调用 JniBridge.ia() 初始化  
+  ↓2. SO 加载时（JNI_OnLoad）
+- read_shell_config() 读取加密配置文件（包含 root_detect、screenshot_protect 等配置）
+- 注册 JNI 方法（包括 isRootDetectEnabled、isScreenshotProtectEnabled）
+- 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）  
+  ↓3. SO 加载时（.init_array）
+- init_dpt() 执行：
+    * 解密 .bitcode 段（如果启用）
+    * dpt_hook() 进行 Hook    ↓4. Hook 关键函数：
+- hook_mmap()：使 DEX 内存可写
+- hook_DefineClass()：拦截类加载
+- hook_execve()：阻止 dex2oat    ↓5. createAntiRiskProcess() 执行（延迟线程中）：
+- 根据 root_detect 配置决定是否执行 ROOT 检测
+- fork() 子进程进行反调试检测
+- 主进程：监控子进程 + 检测 Frida + ROOT（如果启用）
+- 子进程：ptrace 反调试 + ROOT（如果启用）  
+  ↓6. JniBridge.ia() 执行：
+- 从 APK 中读取 CodeItem 文件
+- 解析并加载到内存（dexMap）
+- 提取 DEX 文件到 dataDir    ↓7. combineDexElements()：
+- 将提取的 DEX 合并到 ClassLoader   - 优先从壳的 DEX 查找类  
+  ↓8. 类加载时（DefineClass Hook）：
+- 检测到类被加载
+- 遍历类的所有方法
+- 从 dexMap 查找对应的 CodeItem   - 将 CodeItem 写回方法体位置  
+  ↓9. ProxyApplication.onCreate()：
+- 初始化功能管理器（FeatureManager.initialize()）
+    * 根据配置启用/禁用 ROOT 检测和防截屏功能
+- 注册 ActivityLifecycleCallbacks     * onActivityCreated() → 应用防截屏保护（第一重）
+    * onActivityResumed() → 应用防截屏保护（第二重，双重保险）
+- 调用原 Application.onCreate()   - 应用正常启动
 ```  
   
-#### 3.5.6 配置与参数  
-所有检测开关均通过加密配置文件 (`shell_config.json`) 动态控制，可在打包时通过参数开启/关闭：  
-*   `frida_detect`: 默认开启  
-*   `xposed_detect`: 可选  
-*   `root_detect`: 可选 (轮询间隔 10s)  
-*   `proxy_detect`: 可选 (轮询间隔 10s)    
-### 3.6 子进程反调试  
-  
-**实现位置**：`shell/src/main/cpp/dpt_risk.cpp`  
-  
-**实现原理**：  
-```cpp  void createAntiRiskProcess() {    
-pid_t child = fork();    if(child == 0) {        // 子进程：检测 Frida + ptrace        detectFrida();        doPtrace();  // PTRACE_TRACEME    } else {        // 主进程：监控子进程    
-        protectChildProcess(child);        detectFrida();    }}    
-    
-void* protectProcessOnThread(void* args) {    
-pid_t child = *((pid_t*)args);    int pid = waitpid(child, nullptr, 0);    if(pid > 0) {  // 子进程被调试器 attach 会退出    
-dpt_crash();    }}  ```    
-### 3.7 execve Hook（阻止 dex2oat）  
-  
-**实现位置**：`shell/src/main/cpp/dpt_hook.cpp`  
-  
-**实现原理**：  
-```cpp  int fake_execve(const char *pathname, char *const argv[], char *const envp[]) {    
-if (strstr(pathname, "dex2oat") != nullptr) {        errno = EACCES;        return -1;  // 阻止 dex2oat 执行    
-}    return BYTEHOOK_CALL_PREV(fake_execve, pathname, argv, envp);}  ```    
-### 3.8 字符串混淆  
-  
-**实现位置**：`shell/src/main/cpp/common/obfuscate.h`  
-  
-**实现原理**：  
-- 编译时使用 XOR 加密字符串  
-- 运行时自动解密  
-- 防止字符串在二进制文件中可见  
-  
-### 3.9 mmap Hook（使 DEX 可写）  
-  
-**实现位置**：`shell/src/main/cpp/dpt_hook.cpp`  
-  
-**实现原理**：  
-```cpp  void* fake_mmap(void* __addr, size_t __size, int __prot, int __flags, int __fd, off_t __offset) {    
-    int hasRead = (__prot & PROT_READ) == PROT_READ;    int hasWrite = (__prot & PROT_WRITE) == PROT_WRITE;        if(hasRead && !hasWrite) {    
-prot = prot | PROT_WRITE;  // 添加写权限    
-}        return BYTEHOOK_CALL_PREV(fake_mmap, __addr, __size, prot, __flags, __fd, __offset);  }  ```    
-    
----    
-## 四、未实现功能的实现思路  
-  
-### 4.1 二代 DEX 整体加密保护  
-  
-**实现思路**：  
-1. 编译时：使用 AES 加密整个 DEX 文件  
-2. 运行时：在 ClassLoader 加载 DEX 前解密  
-3. 参考：https://github.com/luoyesiqiu/dpt-shell/issues  
-  
-**关键技术点**：  
-- Hook `DexFile.openDexFile()` 或 `DexFile.loadDex()`  
-- 在内存中解密 DEX 后再传递给系统  
-  
-### 4.2 文件完整性校验  
-  
-**实现思路**：  
-1. 编译时：计算 DEX/SO/资源文件的 SHA256 哈希值  
-2. 运行时：定期校验文件哈希  
-3. 检测到篡改：崩溃或退出  
-  
-**实现代码示例**：  
-```cpp  // 编译时计算哈希  std::string calculateHash(const char* filePath) {    
-SHA256_CTX ctx;    SHA256_Init(&ctx);    // 读取文件并计算哈希    
-    return hash;}    
-    
-// 运行时校验  void verifyIntegrity() {    
-std::string currentHash = calculateHash(dexPath);    if(currentHash != expectedHash) {        dpt_crash();    }}  ```    
-**参考资料**：  
-- Android 文件完整性校验：https://developer.android.com/training/articles/security-config  
-  
-### 4.3 ROOT 检测  
-  
-#### 4.3.1 实现思路  
-  
-ROOT 检测应该采用**多层次、多方式**的综合检测策略，参考现有的 `detectFrida()` 实现方式，在 `dpt_risk.cpp` 中实现。  
-  
-**检测方式**（共 13 种，当前 10 种已启用，3 种已禁用）：  
-1. **文件系统检测** ✅：检测 su 文件、Magisk 文件、root 管理应用、KernelSU 文件  
-2. **系统属性检测** ✅：检测 `ro.build.tags`、`ro.secure` 等属性  
-3. **环境变量检测** ✅：检测 PATH 中的 su  
-4. **SELinux 状态检测** ✅：检测 SELinux 是否被禁用  
-5. **KernelSU 专项检测**：检测内核级 ROOT 方案（KernelSU）  
-   - 检测 KernelSU 文件路径 ✅  
-   - 检测进程 UID（/proc/self/status）✅  
-   - 检测系统分区挂载状态（/proc/mounts）❌ **已禁用（容易误报）**  
-    - 检测内核符号表（/proc/kallsyms）❌ **已禁用（容易误报）**  
-    - 检测内核模块（/proc/modules）✅ **已优化**  
-    - 检测 SELinux 状态文件（/sys/fs/selinux/status）✅  
-   - 尝试执行 su 命令 ❌ **已禁用（可能阻塞）**  
-  
-#### 4.3.2 代码结构设计  
-  
-**文件位置**：  
-- `shell/src/main/cpp/dpt_risk.h`：添加函数声明  
-- `shell/src/main/cpp/dpt_risk.cpp`：实现检测逻辑  
-- `shell/src/main/cpp/dpt.cpp`：集成到 `createAntiRiskProcess()`  
-  
-**函数设计**：  
-```cpp  // dpt_risk.h  void detectRoot();  // 启动 ROOT 检测    
-    
-// dpt_risk.cpp  bool isRooted();  // 检测设备是否已 ROOTvoid* detectRootOnThread(void* args);  // 后台检测线程  ```    
-#### 4.3.3 检测方式详解  
-  
-**方式 1：检测 su 文件路径**  
-```cpp  const char *su_paths[] = {    
-    "/system/bin/su",    "/system/xbin/su",    "/sbin/su",    "/vendor/bin/su",    "/data/local/su",    "/data/local/bin/su",    "/data/local/xbin/su",    "/system/sbin/su",    "/system/bin/failsafe/su",    "/system/xbin/daemonsu",    "/system/etc/init.d/99SuperSUDaemon",    "/dev/com.koushikdutta.superuser.daemon/",    "/system/app/Superuser.apk",    "/system/app/SuperSU.apk",    nullptr};    
-    
-for (int i = 0; su_paths[i] != nullptr; i++) {    
-if (access(su_paths[i], F_OK) == 0) {        return true;    }}  ```    
-**方式 2：检测 Magisk 相关文件**  
-```cpp  const char *magisk_paths[] = {    
-"/sbin/magisk",    "/system/bin/magisk",    "/system/xbin/magisk",    "/data/adb/magisk",    "/cache/magisk.log",    "/data/adb/magisk.db",    "/data/adb/modules",    nullptr};  ```    
-**方式 3：检测系统属性**  
-```cpp  char prop_value[256] = {0};    
-    
-// 检测 ro.build.tags（test-keys 表示测试版本）  if (__system_property_get("ro.build.tags", prop_value) > 0) {    
-    if (strstr(prop_value, "test-keys") != nullptr) {        return true;    }}    
-    
-// 检测 ro.debuggable（调试版本，可能更容易 ROOT）  prop_value[0] = '\0';  if (__system_property_get("ro.debuggable", prop_value) > 0) {    
-if (strcmp(prop_value, "1") == 0) {        // 注意：仅 ro.debuggable=1 不一定表示 ROOT，可作为参考    
-    }}    
-    
-// 检测 ro.secure（安全模式）  prop_value[0] = '\0';  if (__system_property_get("ro.secure", prop_value) > 0) {    
-if (strcmp(prop_value, "0") == 0) {        return true;  // ro.secure=0 通常表示已 ROOT    }}  ```    
-**方式 4：检测 root 管理应用数据目录（包括 KernelSU）**  
-```cpp  const char *root_app_paths[] = {    
-"/data/data/com.noshufou.android.su",    "/data/data/com.thirdparty.superuser",    "/data/data/eu.chainfire.supersu",    "/data/data/com.topjohnwu.magisk",    "/data/data/com.kingroot.kinguser",    "/data/data/com.kingo.root",    "/data/data/com.smedialink.oneclickroot",    "/data/data/com.zhiqupk.root.global",    "/data/data/com.alephzain.framaroot",    "/data/data/com.devadvance.rootcloak",    "/data/data/com.devadvance.rootcloakplus",    // KernelSU 相关应用    
-"/data/data/com.omarea.vtools",      // KernelSU Manager    "/data/data/me.weishu.kernelsu",    "/data/data/com.kernelsu.manager",    nullptr};  ```    
-**方式 5：检测 PATH 环境变量中的 su**  
-```cpp  FILE *fp = popen("which su", "r");  if (fp != nullptr) {    
-char result[256] = {0};    if (fgets(result, sizeof(result), fp) != nullptr) {        if (strlen(result) > 0 && result[0] != '\n') {            pclose(fp);            return true;        }    }    pclose(fp);}  ```    
-**方式 6：检测 SELinux 状态**  
-```cpp  // 通过 getenforce 命令检测  FILE *fp = popen("getenforce", "r");  if (fp != nullptr) {    
-char result[16] = {0};    if (fgets(result, sizeof(result), fp) != nullptr) {        if (strstr(result, "Disabled") != nullptr) {            pclose(fp);            return true;  // SELinux 被禁用，可能已 ROOT        }    }    pclose(fp);}  ```    
-**方式 7：检测 KernelSU 相关文件路径**  
-```cpp  // KernelSU 是内核级 ROOT 方案，会在特定路径留下痕迹  const char *kernelsu_paths[] = {    
-    "/data/adb/ksu",    "/data/adb/modules/ksu",    "/data/adb/ksud",    "/dev/kernelsu",    "/sys/fs/kernelsu",    "/proc/sys/kernel/kernelsu",    nullptr};    
-    
-for (int i = 0; kernelsu_paths[i] != nullptr; i++) {    
-if (access(kernelsu_paths[i], F_OK) == 0) {        return true;    }}  ```    
-**方式 8：检测 /proc/self/status 中的 UID（KernelSU 可能通过内核修改 UID）**  
-```cpp  // 读取当前进程的状态信息  FILE *fp = fopen("/proc/self/status", "r");  if (fp != nullptr) {    
-char line[256] = {0};    while (fgets(line, sizeof(line), fp) != nullptr) {        // 查找 Uid 行：Uid:    1000    1000    1000    1000    
-// 如果第一个 UID 为 0，说明当前进程有 root 权限    
-if (strncmp(line, "Uid:", 4) == 0) {            unsigned int uid = 0;            if (sscanf(line + 4, "%u", &uid) == 1) {                if (uid == 0) {                    fclose(fp);                    return true;  // 检测到 root UID                }            }        }    }    fclose(fp);}  ```    
-**方式 9：检测 /proc/mounts 中系统分区是否被重新挂载为可读写**  
-```cpp  // KernelSU 可能修改系统分区挂载状态  FILE *fp = fopen("/proc/mounts", "r");  if (fp != nullptr) {    
-char line[512] = {0};    while (fgets(line, sizeof(line), fp) != nullptr) {        // 检查 /system 分区是否被重新挂载为可读写    
-// 正常情况下 /system 应该是 ro（只读），如果看到 rw（读写）可能是 ROOT        if (strstr(line, "/system") != nullptr) {            if (strstr(line, " rw,") != nullptr ||                strstr(line, " rw ") != nullptr) {fclose(fp);                return true;            }        }        // 检查 /vendor 分区    
-        if (strstr(line, "/vendor") != nullptr) {            if (strstr(line, " rw,") != nullptr ||                strstr(line, " rw ") != nullptr) {    
-fclose(fp);                return true;            }        }    }    fclose(fp);}  ```    
-**方式 10：检测 /proc/kallsyms 是否可读且包含有效内容**  
-```cpp  // 正常情况下普通应用无法读取内核符号表  // 如果能读取有效的内核符号，可能是 ROOT（KernelSU 可能允许读取）  FILE *fp = fopen("/proc/kallsyms", "r");  if (fp != nullptr) {    
-char line[256] = {0};    int valid_lines = 0;    // 读取前几行，检查是否包含有效的内核符号    
-for (int i = 0; i < 5 && fgets(line, sizeof(line), fp) != nullptr; i++) {        // 检查是否包含有效的内核符号格式（地址 + 类型 + 符号名）    
-        if (strlen(line) > 20) {            if ((line[0] >= '0' && line[0] <= '9') ||                (line[0] >= 'a' && line[0] <= 'f')) {    
-// 检查是否包含符号名（通常在地址和类型之后）    
-for (int j = 0; j < (int)strlen(line) - 1; j++) {                    if (line[j] == ' ' && line[j+1] != ' ' && line[j+1] != '\n') {                        valid_lines++;                        break;                    }                }            }        }    }    fclose(fp);    // 如果能读取到有效的内核符号，可能是 ROOT    if (valid_lines >= 2) {        return true;    }}  ```    
-**方式 11：检测 /proc/modules 中是否有 KernelSU 相关的内核模块**  
-```cpp  // KernelSU 通过内核模块实现，会在 /proc/modules 中显示  FILE *fp = fopen("/proc/modules", "r");  if (fp != nullptr) {    
-char line[512] = {0};    while (fgets(line, sizeof(line), fp) != nullptr) {        // 检查是否有 KernelSU 相关的模块    
-if (strstr(line, "kernelsu") != nullptr ||            strstr(line, "ksu") != nullptr) {            fclose(fp);            return true;        }    }    fclose(fp);}  ```    
-**方式 12：检测 /sys/fs/selinux/status（KernelSU 可能修改 SELinux 状态）**  
-```cpp  // 读取 SELinux 状态文件  FILE *fp = fopen("/sys/fs/selinux/status", "r");  if (fp != nullptr) {    
-char status[16] = {0};    if (fgets(status, sizeof(status), fp) != nullptr) {        // 移除换行符    
-size_t len = strlen(status);        if (len > 0 && status[len - 1] == '\n') {            status[len - 1] = '\0';        }        // 如果 SELinux 状态为 disabled，可能是 ROOT        if (strcmp(status, "disabled") == 0) {            fclose(fp);            return true;        }    }    fclose(fp);}  ```    
-**方式 13：尝试执行 su 命令检测（KernelSU 可能提供 su 命令）**  
-```cpp  // 使用 timeout 避免阻塞，如果 su 不存在或需要用户确认，timeout 会快速返回  FILE *fp = popen("timeout 1 su -c 'id' 2>/dev/null", "r");  if (fp != nullptr) {    
-char result[256] = {0};    if (fgets(result, sizeof(result), fp) != nullptr) {        // 如果返回了 uid=0，说明有 root 权限    
-if (strstr(result, "uid=0") != nullptr) {            pclose(fp);            return true;        }    }    pclose(fp);}  ```    
-#### 4.3.4 已实现的检测功能清单  
-  
-**当前实现状态**（共 13 种检测方式，其中 10 种已启用，3 种已禁用）：  
-  
-| 方式 | 检测内容 | 状态 | 说明 |  |------|---------|------|------|  | 方式 1 | 检测 su 文件路径（15 个常见路径） | ✅ 已启用 | 检测传统 ROOT 工具的 su 文件 |  | 方式 2 | 检测 Magisk 相关文件（7 个路径） | ✅ 已启用 | 检测 Magisk ROOT 方案 |  | 方式 3 | 检测系统属性（ro.build.tags, ro.secure） | ✅ 已启用 | 检测系统属性异常 |  | 方式 4 | 检测 root 管理应用数据目录（包括 KernelSU 应用） | ✅ 已启用 | 检测已安装的 ROOT 管理应用 |  | 方式 5 | 检测 PATH 环境变量中的 su | ✅ 已启用 | 检测 PATH 中的 su 命令 |  | 方式 6 | 检测 SELinux 状态（getenforce） | ✅ 已启用 | 检测 SELinux 是否被禁用 |  | 方式 7 | 检测 KernelSU 相关文件路径（7 个路径） | ✅ 已启用 | 检测 KernelSU 特有文件 |  | 方式 8 | 检测进程 UID（/proc/self/status） | ✅ 已启用 | 检测当前进程是否有 root UID |  | 方式 9 | 检测系统分区挂载状态（/proc/mounts） | ❌ **已禁用** | **容易误报，已禁用** |  | 方式 10 | 检测内核符号表（/proc/kallsyms） | ❌ **已禁用** | **容易误报，已禁用** |  | 方式 11 | 检测内核模块（/proc/modules） | ✅ 已启用 | 检测 KernelSU 内核模块（已优化） |  | 方式 12 | 检测 SELinux 状态文件（/sys/fs/selinux/status） | ✅ 已启用 | 检测 SELinux 状态文件 |  | 方式 13 | 尝试执行 su 命令 | ❌ **已禁用** | **可能阻塞，已禁用** |    
-**核心检测函数**：  
-```cpp  /**    
-* 检测设备是否已 ROOT * 综合多种检测方式，提高准确性    
-* @return true 如果检测到 ROOT，false 否则    
- */DPT_ENCRYPT bool isRooted() {    
-// 方式 1：检测 su 文件路径（15 个常见路径）✅    
-// 方式 2：检测 Magisk 相关文件（7 个路径）✅    
-// 方式 3：检测系统属性（ro.build.tags, ro.secure）✅    
-// 方式 4：检测 root 管理应用数据目录（包括 KernelSU 应用）✅    
-// 方式 5：检测 PATH 环境变量中的 su ✅    
-// 方式 6：检测 SELinux 状态（getenforce）✅    
-// 方式 7：检测 KernelSU 相关文件路径（7 个路径）✅    
-// 方式 8：检测 /proc/self/status 中的 UID ✅    
-// 方式 9：检测 /proc/mounts 中系统分区挂载状态 ❌ 已禁用（容易误报）    
-// 方式 10：检测 /proc/kallsyms 可读性 ❌ 已禁用（容易误报）    
-// 方式 11：检测 /proc/modules 中的内核模块 ✅（已优化）    
-// 方式 12：检测 /sys/fs/selinux/status ✅    
-// 方式 13：尝试执行 su 命令 ❌ 已禁用（可能阻塞）    
-// 如果任一方式检测到 ROOT，返回 true    return false;}  ```    
-**后台检测线程**：  
-```cpp  /**    
-* ROOT 检测线程（持续运行）    
-* 定期检测设备 ROOT 状态    
- */[[noreturn]] DPT_ENCRYPT void *detectRootOnThread(__unused void *args) {    
-while (true) {        if (isRooted()) {            // 1) 置位 ROOT 检测标志（供 Java 层查询并弹窗告警）    
-// 2) 启动延迟退出（避免“秒崩无提示”）    
-mark_root_detected();            schedule_root_delayed_crash_once();        }        sleep(10);  // 每 10 秒检测一次    
-}}  ```    
-**启动检测函数**：  
-```cpp  /**    
-* 启动 ROOT 检测    
-* 1. 立即检测一次    
-* 2. 启动后台检测线程    
- */DPT_ENCRYPT void detectRoot() {    
-// 立即检测一次    
-if (isRooted()) {        // 1) 置位 ROOT 检测标志（供 Java 层查询并弹窗告警）    
-// 2) 启动延迟退出（避免“秒崩无提示”）    
-mark_root_detected();        schedule_root_delayed_crash_once();        return;    }    // 启动后台检测线程    
-pthread_t t;    pthread_create(&t, nullptr, detectRootOnThread, nullptr);}  ```    
-**Java 层查询接口（JNI）**：  
-```cpp  // native: dpt_risk.cpp  bool isRootDetected();    
-    
-// JNI: dpt.cpp 注册  // "isRootDetected", "()Z"  ```    
-**Java 层弹窗入口**（推荐放在 `ProxyComponentFactory`，因为能拿到稳定的 Activity WindowToken）：  
-- `instantiateApplication()` 启动主线程 watcher（短轮询），等待 `JniBridge.isRootDetected()` 变为 true  
-- `instantiateActivity()` 记录最近的 Activity，并在 Activity 可用时展示弹窗  
-- 重点：避免在过渡 Activity（例如 `PandoraEntry`）上直接 `show()`，否则可能 `WindowLeaked` 导致用户看不到弹窗  
-  
-#### 4.3.5 命令行参数控制  
-  
-**参数说明**：  
-- `--enable-root-detect`：启用 ROOT 检测加固功能（**默认关闭**）  
-- `--disable-root-detect`：强制禁用 ROOT 检测加固功能（即使已启用）  
-  
-**使用示例**：  
-```bash  # 启用 ROOT 检测  java -jar dpt.jar -f input.apk -o out/ --enable-root-detect    
-    
-# 禁用 ROOT 检测（默认行为，可省略）  java -jar dpt.jar -f input.apk -o out/    
-    
-# 强制禁用 ROOT 检测（即使之前启用过）  java -jar dpt.jar -f input.apk -o out/ --disable-root-detect    
-```    
-**配置传递机制**：  
-1. **编译时**：`dpt.jar` 将 `root_detect` 配置写入加密的 JSON 配置文件 `d_shell_data_001`，存储在 APK 的 `assets` 目录  
-2. **运行时**：shell 在 `JNI_OnLoad()` 中读取并解密配置文件，解析 JSON 获取 `root_detect` 字段  
-3. **执行控制**：根据 `root_detect` 配置值决定是否执行 `detectRoot()`  
-  
-**配置写入位置**：  
-```java  // dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java  public void writeConfig(String packageDir, byte[] key) {    
-// ...    JSONObject jsonObject = new JSONObject(baseJson);    jsonObject.put("root_detect", isRootDetect());  // 写入 root_detect 配置    
-String json = jsonObject.toString();    // AES 加密后写入 assets/d_shell_data_001}    
-```    
-**配置读取位置**：  
-```cpp  // shell/src/main/cpp/dpt.cpp::read_shell_config()  void read_shell_config(JNIEnv *env) {    
-// 从 APK 读取并解密配置文件    
-// 解析 JSON，读取 root_detect 字段    
-g_shell_config.root_detect = shell_config.value("root_detect", false);}  ```    
-#### 4.3.6 集成位置  
-  
-**集成到 `createAntiRiskProcess()`**（**条件执行**）：  
-```cpp  // dpt.cpp::createAntiRiskProcess()  DPT_ENCRYPT void createAntiRiskProcess() {    
-// 根据配置决定是否检测 ROOT（其他反调试功能始终启用）    
-if (g_shell_config.root_detect) {        // ROOT 检测已启用，首先检测 ROOT（在主进程和子进程都要检测）    
-detectRoot();    } else {        // ROOT 检测已禁用，跳过 ROOT 检测（不影响其他反调试功能）    
-}    // fork 子进程（无论 ROOT 检测是否启用，都要执行反调试功能）    
-pid_t child = fork();    if(child < 0) {        // fork 失败，只检测 Frida（和 ROOT，如果启用）    
-detectFrida();        if (g_shell_config.root_detect) {            detectRoot();        }    }    else if(child == 0) {        // 子进程：检测 ptrace（和 ROOT，如果启用）    
-// 注意：子进程中不调用 detectFrida()，避免创建线程导致问题    
-if (g_shell_config.root_detect) {            detectRoot();        }        doPtrace();  // ptrace 反调试始终执行    
-}    else {        // 主进程：监控子进程 + 检测 Frida（和 ROOT，如果启用）    
-protectChildProcess(child);  // 子进程监控始终执行    
-detectFrida();  // Frida 检测始终执行    
-if (g_shell_config.root_detect) {            detectRoot();        }    }}  ```    
-**重要说明**：  
-- ✅ **ROOT 检测可根据命令行参数控制**：默认关闭，使用 `--enable-root-detect` 启用  
-- ✅ **其他反调试功能不受影响**：Frida 检测、ptrace 反调试、子进程监控等功能始终执行  
-- ✅ **配置通过加密 JSON 传递**：编译时写入，运行时读取，确保安全性  
-  
-#### 4.3.7 执行流程  
-  
-```  应用启动    
-    ↓ProxyApplication.attachBaseContext()    
-    ↓加载 shell SO（System.load）    
-    ↓JNI_OnLoad()（SO 加载时）    
-├─→ read_shell_config() 读取加密配置文件    
-│   ├─→ 从 APK assets/d_shell_data_001 读取    
-│   ├─→ AES 解密    
-│   ├─→ 解析 JSON，读取 root_detect 字段    
-│   └─→ 设置 g_shell_config.root_detect    │    └─→ 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）    
-└─→ createAntiRiskProcess()            ├─→ 根据 g_shell_config.root_detect 决定是否执行 detectRoot()            │   └─→ 如果 root_detect = true：    
-            │       └─→ detectRoot()（立即检测一次）    
-│           ├─→ isRooted() 综合检测（10 种已启用的检测方式）    
-│           │   ├─→ 方式 1：检测 su 文件路径（15 个路径）✅    
-│           │   ├─→ 方式 2：检测 Magisk 文件（7 个路径）✅    
-│           │   ├─→ 方式 3：检测系统属性（ro.build.tags, ro.secure）✅    
-│           │   ├─→ 方式 4：检测 root 管理应用（包括 KernelSU 应用）✅    
-│           │   ├─→ 方式 5：检测 PATH 中的 su ✅    
-│           │   ├─→ 方式 6：检测 SELinux 状态 ✅    
-│           │   ├─→ 方式 7：检测 KernelSU 文件路径（7 个路径）✅    
-│           │   ├─→ 方式 8：检测进程 UID（/proc/self/status）✅    
-│           │   ├─→ 方式 9：检测系统分区挂载状态 ❌ 已禁用    
-│           │   ├─→ 方式 10：检测内核符号表 ❌ 已禁用    
-│           │   ├─→ 方式 11：检测内核模块（/proc/modules）✅    
-│           │   ├─→ 方式 12：检测 SELinux 状态文件（/sys/fs/selinux/status）✅    
-│           │   └─→ 方式 13：尝试执行 su 命令 ❌ 已禁用    
-│           │            │           └─→ 如果检测到 ROOT：    
-│               ├─→ 设置 g_root_detected=true（供 Java 层查询）    
-│               ├─→ 启动延迟退出线程（默认 10s 后调用 dpt_crash()）    
-│               └─→ Java 层 watcher 在稳定 Activity 上弹出告警弹窗    
-│           │            │           └─→ 启动 detectRootOnThread() 后台线程    
-│               └─→ 每 10 秒检测一次    
-│                   └─→ 如果检测到 ROOT：同上（置位 + 延迟退出）    
-│            ├─→ fork() 子进程（无论 ROOT 检测是否启用，都要执行）    
-│            ├─→ 主进程分支：    
-            │   ├─→ protectChildProcess()（子进程监控，始终执行）    
-            │   ├─→ detectFrida()（Frida 检测，始终执行）    
-            │   └─→ detectRoot()（如果 root_detect = true）    
-│            └─→ 子进程分支：    
-                ├─→ detectRoot()（如果 root_detect = true）    
-                └─→ doPtrace()（ptrace 反调试，始终执行）  ```    
-**关键点说明**：  
-1. **配置读取时机**：在 `JNI_OnLoad()` 中读取，确保在反调试逻辑执行前完成  
-2. **延迟启动**：`createAntiRiskProcess()` 在延迟线程中执行（延迟 500ms），避免在 `JNI_OnLoad()` 中直接 `fork()` 导致崩溃  
-3. **条件执行**：ROOT 检测根据 `root_detect` 配置值决定是否执行，其他反调试功能始终执行  
-4. **不影响其他功能**：Frida 检测、ptrace 反调试、子进程监控等功能不受 ROOT 检测开关影响  
-  
-#### 4.3.8 字符串混淆  
-  
-**使用 AY_OBFUSCATE 宏**：  所有检测路径都应该使用 `AY_OBFUSCATE()` 宏进行字符串混淆，防止静态分析：  
-  
-```cpp  const char *su_path = AY_OBFUSCATE("/system/bin/su");  const char *magisk_path = AY_OBFUSCATE("/sbin/magisk");  const char *prop_name = AY_OBFUSCATE("ro.build.tags");  ```    
-#### 4.3.9 KernelSU 检测说明  
-  
-**KernelSU 的特殊性**：  
-- KernelSU 是**内核级 ROOT 方案**，通过修改内核实现 ROOT 权限  
-- 相比传统的用户空间 ROOT 方案（如 SuperSU、Magisk），KernelSU 更难检测  
-- KernelSU 可能不会在常见路径留下 su 文件，也不会修改系统属性  
-- 因此需要采用**更深层次的检测方式**（方式 7-13）  
-  
-**针对 KernelSU 的检测策略**（当前实现状态）：  
-1. **文件路径检测**（方式 7）✅：检测 KernelSU 特有的文件路径（7 个路径）  
-2. **进程 UID 检测**（方式 8）✅：KernelSU 可能通过内核修改进程 UID  
-3. **挂载点检测**（方式 9）❌：检测系统分区是否被重新挂载为可读写（**已禁用，容易误报**）  
-4. **内核符号表检测**（方式 10）❌：检测是否能读取有效的内核符号（**已禁用，容易误报**）  
-5. **内核模块检测**（方式 11）✅：检测是否有 KernelSU 相关的内核模块（**已优化**）  
-6. **SELinux 状态检测**（方式 12）✅：检测 SELinux 是否被禁用  
-7. **su 命令检测**（方式 13）❌：尝试执行 su 命令验证是否有 ROOT 权限（**已禁用，可能阻塞**）  
-  
-**检测效果**：  
-- 通过综合使用当前已启用的 10 种检测方式，可以有效检测到 KernelSU  
-- 即使 KernelSU 隐藏了部分痕迹，其他检测方式仍可能发现 ROOT 状态  
-- 已禁用的检测方式（方式 9、10、13）虽然可能提高检测率，但容易误报，因此已禁用  
-- 建议定期更新检测方式，以应对 KernelSU 的更新  
-  
-#### 4.3.10 误报风险与已禁用检测方式说明  
-  
-**可能导致误报的检测方式（已禁用）**：  
-  
-1. **方式 9：检测系统分区挂载状态（/proc/mounts）** ❌ **已禁用**  
-    - **误报原因**：  
-      - 某些正常设备上，系统分区可能被挂载为 `rw`（可读写），这不一定是 ROOT 的标志  
-      - 某些厂商 ROM 或开发版本可能允许系统分区可写  
-      - 检测逻辑过于严格，容易误判正常设备为 ROOT  
-    - **禁用状态**：代码中已注释，不会执行此检测  
-    - **影响**：可能无法检测到通过重新挂载系统分区实现的 ROOT，但避免了误报  
-  
-2. **方式 10：检测内核符号表（/proc/kallsyms）** ❌ **已禁用**  
-    - **误报原因**：  
-      - 某些设备即使没有 ROOT，也可能允许读取 `/proc/kallsyms`  
-        - 虽然内容可能是全 0，但检测逻辑可能不够严格，导致误报  
-      - 不同设备的内核符号表格式可能不同，检测逻辑难以适配所有设备  
-    - **禁用状态**：代码中已注释，不会执行此检测  
-    - **影响**：可能无法检测到通过内核符号表暴露的 ROOT，但避免了误报  
-  
-3. **方式 13：尝试执行 su 命令** ❌ **已禁用**  
-    - **误报/阻塞原因**：  
-        - `timeout` 命令在某些 Android 设备上可能不存在，导致命令执行失败  
-      - 即使使用 `timeout`，在某些设备上仍可能阻塞  
-      - 如果设备有 su 但需要用户确认，可能导致应用启动时阻塞  
-    - **禁用状态**：代码中已注释，不会执行此检测  
-    - **影响**：可能无法检测到通过 su 命令实现的 ROOT，但避免了阻塞和兼容性问题  
-  
-**已优化检测方式**：  
-  
-4. **方式 11：检测内核模块（/proc/modules）** ✅ **已优化**  
-    - **优化内容**：  
-      - 更精确地匹配 "kernelsu" 模块名  
-      - 检查独立的 "ksu" 模块时，确保它是模块名的一部分，而不是其他字符串的一部分  
-      - 避免误报（如其他模块名包含 "ksu" 字符串）  
-    - **状态**：已启用，检测逻辑已优化  
-  
-#### 4.3.10 注意事项  
-  
-1. **误报风险**：  
-    - `ro.debuggable=1` 不一定表示 ROOT（可能是开发版本）  
-    - `ro.build.tags=test-keys` 可能是官方测试版本  
-   - 已禁用的检测方式（方式 9、10、13）容易误报，因此已禁用  
-   - 建议综合多种检测方式（当前 10 种已启用），避免单一检测的误报  
-  
-2. **绕过可能**：  
-   - Magisk Hide 可能会隐藏 ROOT 痕迹  
-   - KernelSU 作为内核级 ROOT 方案，可能更难检测  
-   - 某些高级 ROOT 工具可能会 Hook 系统调用  
-   - 建议结合多种检测方式（当前 10 种已启用），提高检测准确性  
-   - 建议结合其他检测方式（如 Frida 检测）  
-  
-3. **性能影响**：  
-   - 文件系统检测（access）性能开销很小  
-   - 系统属性检测性能开销很小  
-    - `/proc` 目录访问性能开销很小  
-   - 后台线程每 10 秒检测一次，对性能影响很小  
-  
-4. **兼容性**：  
-    - `popen()` 在某些 Android 版本可能不可用，已添加错误处理  
-    - `/proc` 目录访问需要权限，可能在某些设备上失败，已添加错误处理  
-   - 所有文件操作都有错误检查，避免检测失败导致应用崩溃  
-  
-5. **检测时机**：  
-   - 应用启动时立即检测一次  
-   - 后台线程持续检测（每 10 秒）  
-   - 主进程和子进程都要检测，提高可靠性  
-  
-6. **日志输出**：  
-   - 使用 `DLOGD()` 输出调试日志  
-   - 检测到 ROOT 时输出警告日志（`DLOGW()`）  
-   - 避免输出敏感信息（如检测路径，已使用字符串混淆）  
-    - **重要**：release 构建下 `DLOG*` 可能会被编译为空（取决于编译宏），排查 Java 弹窗链路建议使用 `[ROOT_WARNING]` 前缀日志  
-  
-7. **检测方式启用/禁用**：  
-   - 当前共实现 13 种检测方式，其中 10 种已启用，3 种已禁用  
-   - 已禁用的检测方式在代码中已注释，不会执行  
-   - 如需启用已禁用的检测方式，需要在实际设备上充分测试，避免误报  
-  
-#### 4.3.11 头文件依赖  
-  
-**需要在 `dpt_risk.h` 中添加**：  
-```cpp  #include <sys/system_properties.h>  // 系统属性检测  #include <fcntl.h>                  // access() 函数  #include <stdio.h>                   // popen(), fgets()  #include <dirent.h>                  // /proc 目录遍历  ```    
-#### 4.3.12 测试建议  
-  
-1. **正常设备测试**：  
-   - 在未 ROOT 的设备上运行，应用应正常启动  
-   - 检查 logcat，确认没有误报  
-  
-2. **ROOT 设备测试**：  
-   - 在已 ROOT 的设备上运行：  
-      - 应在稳定界面出现后弹出 **安全告警弹窗**  
-        - 默认在 **约 10 秒后自动退出**  
-        - 点击弹窗“确定”后应 **立即退出**  
-    - 测试不同的 ROOT 工具（SuperSU、Magisk、KingRoot、KernelSU 等）  
-    - **重点测试 KernelSU**：KernelSU 是内核级 ROOT 方案，需要验证当前已启用的 10 种检测方式是否有效  
-   - 测试已禁用的检测方式（方式 9、10、13）在实际设备上的表现，评估是否可以重新启用  
-  
-3. **误报测试**：  
-   - 在正常设备上运行，应用应正常启动  
-   - 测试不同厂商的 ROM（MIUI、ColorOS、OneUI 等）  
-   - 测试开发版本和测试版本，确认不会误报  
-   - 如果发现误报，需要进一步优化检测逻辑或禁用相关检测方式  
-  
-3. **绕过测试**：  
-   - 测试 Magisk Hide 是否能绕过检测  
-   - 测试删除 su 文件后是否能绕过检测  
-  
-4. **性能测试**：  
-   - 监控检测线程的 CPU 占用  
-   - 确认检测不影响应用正常使用  
-  
-#### 4.3.13 参考资源  
-  
-- **RootBeer**：https://github.com/scottyab/rootbeer  
-- **Android 系统属性**：https://source.android.com/devices/tech/config  
-- **Magisk 文档**：https://topjohnwu.github.io/Magisk/  
-- **KernelSU 文档**：https://kernelsu.org/  
-- **KernelSU GitHub**：https://github.com/tiann/KernelSU  
-- **SELinux 文档**：https://source.android.com/security/selinux  
-- **Android Root 检测最佳实践**：https://github.com/scottyab/rootbeer/blob/master/README.md  
-  
-### 4.4 模拟器检测  
-  
-**实现思路**：  
-1. 检测系统属性：`ro.kernel.qemu`, `ro.hardware`  
-2. 检测硬件特征：IMEI、手机号、传感器  
-3. 检测文件特征：`/dev/socket/qemud`  
-  
-**实现代码示例**：  
-```cpp  bool isEmulator() {    
-    char prop[256];    __system_property_get("ro.kernel.qemu", prop);    if(strcmp(prop, "1") == 0) return true;        __system_property_get("ro.hardware", prop);    
-    if(strstr(prop, "goldfish")) return true;        if(access("/dev/socket/qemud", F_OK) == 0) return true;    
-return false;  }  ```    
-**参考资料**：  
-- Android Emulator Detection：https://github.com/Fuzion24/AndroidEmulatorDetection  
-  
-### 4.5 Xposed/Substrate 检测  
-  
-**实现思路**：  
-1. 检测 Xposed：`/system/framework/XposedBridge.jar`  
-2. 检测 Substrate：`/data/data/com.saurik.substrate`  
-3. Hook 检测：尝试 Hook 系统函数，检测是否被 Hook  
-  
-**实现代码示例**：  
-```cpp  bool isXposedInstalled() {    
-if(access("/system/framework/XposedBridge.jar", F_OK) == 0) return true;    // 检测 Xposed 类    
-void* handle = dlopen("libxposed_art.so", RTLD_NOW);    if(handle != nullptr) {        dlclose(handle);        return true;    }        return false;  }  ```    
-**参考资料**：  
-- Xposed 检测：https://github.com/rovo89/XposedBridge  
-  
-### 4.6 字符串加密（DEX 中）  
-  
-**实现思路**：  
-1. 编译时：使用 ASM 或 Javassist 修改 DEX，加密字符串常量  
-2. 运行时：Hook `String` 类的初始化，解密字符串  
-  
-**实现方案**：  
-- 使用 ASM 在编译时修改字节码  
-- 将所有字符串替换为加密后的字节数组  
-- 运行时通过 JNI 解密  
-  
-**参考资料**：  
-- ASM 框架：https://asm.ow2.io/  
-- 字符串加密示例：https://github.com/obfuscator-llvm/obfuscator  
-  
-### 4.7 资源文件加密  
-  
-**实现思路**：  
-1. 编译时：加密 res/ 和 assets/ 中的资源文件  
-2. 运行时：Hook `AssetManager.open()` 和 `Resources.openRawResource()`  
-3. 在读取时解密  
-  
-**实现代码示例**：  
-```cpp  // Hook AssetManager.open()  int fake_AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {    
-AAsset* asset = AAssetManager_open(mgr, filename, mode);    if(asset != nullptr && isEncrypted(filename)) {        // 读取加密数据    
-// 解密    
-// 返回解密后的 Asset    }    return asset;}  ```    
-**参考资料**：  
-- Android 资源保护：https://developer.android.com/guide/topics/resources/providing-resources  
-  
-### 4.8 VMP 虚拟化保护  
-  
-**实现思路**：  
-1. 将 DEX 指令转换为自定义虚拟指令  
-2. 实现虚拟解释器执行虚拟指令  
-3. 虚拟指令与真实指令一一对应  
-  
-**实现方案**：  
-- 使用 LLVM Obfuscator 或自定义编译器  
-- 将 Dalvik 指令映射到虚拟指令集  
-- 实现虚拟解释器（类似 JVM）  
-  
-**参考资料**：  
-- LLVM Obfuscator：https://github.com/obfuscator-llvm/obfuscator  
-- VMP 原理：https://bbs.pediy.com/thread-216095.htm  
-  
-### 4.9 Java2CPP 转换  
-  
-**实现思路**：  
-1. 使用 J2C 工具将 Java 代码转换为 C++  
-2. 编译为 SO 文件  
-3. 通过 JNI 调用  
-  
-**实现方案**：  
-- 使用 JNI 生成工具（如 SWIG）  
-- 或使用自定义编译器  
-  
-**参考资料**：  
-- JNI 开发指南：https://docs.oracle.com/javase/8/docs/technotes/guides/jni/  
-  
-### 4.10 防内存 DUMP  
-  
-**实现思路**：  
-1. Hook `memcpy`, `fwrite` 等内存操作函数  
-2. 检测内存读取操作  
-3. 混淆内存布局  
-  
-**实现代码示例**：  
-```cpp  void* fake_memcpy(void* dest, const void* src, size_t n) {    
-// 检测是否在读取 DEX 内存    
-if(isDexMemory(src)) {        // 返回假数据或崩溃    
-dpt_crash();    }    return BYTEHOOK_CALL_PREV(fake_memcpy, dest, src, n);}  ```    
-### 4.11 APK 签名校验  
-  
-**实现思路**：  
-1. 在 Application 启动时校验 APK 签名  
-2. 与预期签名对比  
-3. 不匹配则退出  
-  
-**实现代码示例**：  
-```java  public static boolean verifySignature(Context context) {    
-    PackageManager pm = context.getPackageManager();    PackageInfo packageInfo = pm.getPackageInfo(        context.getPackageName(),        PackageManager.GET_SIGNATURES    
-);    Signature[] signatures = packageInfo.signatures;    String signature = signatures[0].toCharsString();    // 与预期签名对比    
-return signature.equals(EXPECTED_SIGNATURE);}    
-```    
-**参考资料**：  
-- Android 签名机制：https://source.android.com/security/apksigning  
-  
-### 4.12 防截屏  
-  
-#### 4.12.1 实现思路  
-  
-防截屏功能通过设置 Android 的 `FLAG_SECURE` 窗口标志来防止用户截屏和录屏。该功能采用**统一的功能管理架构**，与其他功能模块解耦，便于扩展和维护。  
-  
-**核心机制**：  
-- 使用 `WindowManager.LayoutParams.FLAG_SECURE` 标志  
-- 采用**双重保险**策略：在 Activity 创建和恢复时都应用保护  
-- 通过命令行参数控制，默认关闭，按需启用  
-- 配置通过加密 JSON 传递，确保安全性  
-  
-#### 4.12.2 命令行参数控制  
-  
-**参数说明**：  
-- `--enable-screenshot-protect`：启用防截屏加固功能（**默认关闭**）  
-  
-**使用示例**：  
-```bash  # 启用防截屏功能  java -jar dpt.jar -f input.apk -o out/ --enable-screenshot-protect    
-    
-# 同时启用 ROOT 检测和防截屏  java -jar dpt.jar -f input.apk -o out/ --enable-root-detect --enable-screenshot-protect    
-```    
-#### 4.12.3 配置传递机制  
-  
-**配置写入位置**：  
-```java  // dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java  public void writeConfig(String packageDir, byte[] key) {    
-// ...    JSONObject jsonObject = new JSONObject(baseJson);    jsonObject.put("root_detect", isRootDetect());    jsonObject.put("screenshot_protect", isScreenshotProtect());  // 写入防截屏配置    
-String json = jsonObject.toString();    // AES 加密后写入 assets/d_shell_data_001}    
-```    
-**配置读取位置**：  
-```cpp  // shell/src/main/cpp/dpt.cpp::read_shell_config()  void read_shell_config(JNIEnv *env) {    
-// 从 APK 读取并解密配置文件    
-// 解析 JSON，读取 screenshot_protect 字段    
-g_shell_config.screenshot_protect = shell_config.value("screenshot_protect", false);}  ```    
-#### 4.12.4 功能管理架构  
-  
-**统一功能管理接口**：  
-```java  // shell/src/main/java/com/luoyesiqiu/shell/feature/FeatureManager.java  public class FeatureManager {    
-/**     * 初始化所有功能模块    
-* 根据配置启用或禁用各个功能    
-*/    public static void initialize(boolean rootDetectEnabled, boolean screenshotProtectEnabled) {        // 初始化防截屏功能    
-        if (screenshotProtectEnabled) {            ScreenshotProtectFeature.enable();        } else {            ScreenshotProtectFeature.disable();        }    }    
-/**     * 在 Activity 创建时应用所有需要的功能    
-     */    public static void onActivityCreated(Activity activity) {        ScreenshotProtectFeature.applyToActivity(activity);    }    
-/**     * 在 Activity 恢复时应用所有需要的功能（双重保险）    
-*/    public static void onActivityResumed(Activity activity) {        ScreenshotProtectFeature.applyToActivity(activity);    }}    
-```    
-**防截屏功能模块**：  
-```java  // shell/src/main/java/com/luoyesiqiu/shell/feature/ScreenshotProtectFeature.java  public class ScreenshotProtectFeature {    
-    private static volatile boolean sEnabled = false;    
-/**     * 为 Activity 应用防截屏保护（直接设置）    
-* 使用 setFlags 而不是 addFlags，确保标志被正确设置    
-     */    public static void applyToActivity(Activity activity) {        if (!sEnabled || activity == null) {            return;        }    
-try {            Window window = activity.getWindow();            if (window != null) {                // 使用 setFlags 确保 FLAG_SECURE 被正确设置    
-                window.setFlags(                    WindowManager.LayoutParams.FLAG_SECURE,                    WindowManager.LayoutParams.FLAG_SECURE                );                Log.d(TAG, "[SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to " + activity.getClass().getName());            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] ✗ Failed to apply FLAG_SECURE", t);        }    }    
-/**     * 延迟应用防截屏保护（确保窗口已创建）    
-* 在某些情况下，Activity 创建时窗口可能还未准备好，需要延迟设置    
-     */    public static void applyToActivityDelayed(Activity activity) {        if (!sEnabled || activity == null) {            return;        }    
-try {            Window window = activity.getWindow();            if (window == null) {                // 如果窗口还未创建，使用 Handler 延迟重试    
-                android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());                handler.postDelayed(() -> applyToActivity(activity), 100);                return;            }    
-android.view.View decorView = window.getDecorView();            if (decorView != null && decorView.isAttachedToWindow()) {                // 窗口已创建且已 attach，直接设置    
-applyToActivity(activity);            } else if (decorView != null) {                // 窗口未 attach，等待 attach 后再设置    
-decorView.post(() -> applyToActivity(activity));            } else {                // decorView 为 null，延迟重试    
-android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());                handler.postDelayed(() -> applyToActivity(activity), 200);            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] Failed to apply FLAG_SECURE (delayed)", t);            applyToActivity(activity); // 失败时尝试直接设置    
-}    }}    
-```    
-#### 4.12.5 集成位置  
-  
-**在 ProxyComponentFactory.instantiateApplication() 中初始化**：  
-```java  // shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  @Override  public Application instantiateApplication(@NonNull ClassLoader cl, @NonNull String className) {    
-// ... 加载 shell SO 和初始化逻辑 ...    // 初始化功能管理器（根据配置启用/禁用各个功能）    
-// 注意：如果应用使用了 AppComponentFactory，ProxyApplication.onCreate() 可能不会被调用    
-// 所以需要在这里初始化功能管理器    
-boolean rootDetectEnabled = JniBridge.isRootDetectEnabled();    boolean screenshotProtectEnabled = JniBridge.isScreenshotProtectEnabled();    FeatureManager.initialize(rootDetectEnabled, screenshotProtectEnabled);    // 创建原应用的 Application    Application app = ...;    // 在创建的 Application 上注册 ActivityLifecycleCallbacks    if (app != null) {        app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {            @Override            public void onActivityCreated(Activity activity, Bundle savedInstanceState) {                FeatureManager.onActivityCreated(activity);  // 第一重保护（延迟设置）    
-            }                        @Override    
-public void onActivityResumed(Activity activity) {                FeatureManager.onActivityResumed(activity);  // 第二重保护（直接设置，双重保险）    
-}            // ... 其他回调方法    
-});    }        return app;  }    
-```    
-**在 ProxyComponentFactory.instantiateActivity() 中应用**：  
-```java  // shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  @Override  public Activity instantiateActivity(@NonNull ClassLoader cl, @NonNull String className, Intent intent) {    
-Activity activity = super.instantiateActivity(cl, className, intent);    // 应用功能到新创建的 Activity（第三重保护，确保覆盖）    
-FeatureManager.onActivityCreated(activity);        return activity;  }    
-```    
-#### 4.12.6 执行流程  
-  
-```  应用启动    
-    ↓ProxyComponentFactory.instantiateApplication()（Android 9+）    
-├─→ 加载 shell SO（JniBridge.loadShellLibs）    
-    │   └─→ JNI_OnLoad()（SO 加载时）    
-│       ├─→ read_shell_config() 读取加密配置文件    
-│       │   ├─→ 从 APK assets/d_shell_data_001 读取    
-│       │   ├─→ AES 解密    
-│       │   ├─→ 解析 JSON，读取 screenshot_protect 字段    
-│       │   └─→ 设置 g_shell_config.screenshot_protect    │       │    │       └─→ 注册 JNI 方法（包括 isScreenshotProtectEnabled）    
-│    ├─→ JniBridge.isScreenshotProtectEnabled() 查询配置    
-├─→ FeatureManager.initialize() 初始化功能管理器    
-│   └─→ ScreenshotProtectFeature.enable() / disable()    │    ├─→ 创建原应用的 Application    └─→ 在 Application 上注册 ActivityLifecycleCallbacks        ├─→ onActivityCreated() → FeatureManager.onActivityCreated()        │   └─→ ScreenshotProtectFeature.applyToActivityDelayed()（第一重保护，延迟设置）    
-        │        └─→ onActivityResumed() → FeatureManager.onActivityResumed()            └─→ ScreenshotProtectFeature.applyToActivity()（第二重保护，直接设置，双重保险）    
-    ↓ProxyComponentFactory.instantiateActivity()    
-    └─→ FeatureManager.onActivityCreated()        └─→ ScreenshotProtectFeature.applyToActivityDelayed()（第三重保护，确保覆盖）  ```    
-#### 4.12.7 三重保险机制  
-  
-**为什么需要三重保险**：  
-1. **Activity 创建时机**：某些 Activity 可能在 `onCreate()` 之后才设置窗口标志，需要再次确认  
-2. **窗口准备时机**：Activity 创建时窗口可能还未完全准备好，需要延迟设置  
-3. **Activity 恢复场景**：从后台恢复的 Activity 可能需要重新应用保护  
-4. **兼容性考虑**：不同 Android 版本和厂商 ROM 的行为可能不同  
-5. **AppComponentFactory 场景**：如果应用使用了 AppComponentFactory，需要在多个入口点应用保护  
-  
-**保护时机和方式**：  
-- **第一重**：`ProxyComponentFactory.instantiateActivity()` 中应用（延迟设置，确保窗口已创建）  
-  - 调用 `ScreenshotProtectFeature.applyToActivityDelayed()`  
-    - 使用 `decorView.post()` 或 `Handler.postDelayed()` 延迟设置  
-    - **第二重**：Application 的 `ActivityLifecycleCallbacks.onActivityCreated()` 回调中应用（延迟设置）  
-  - 调用 `ScreenshotProtectFeature.applyToActivityDelayed()`  
-    - 确保窗口已创建后再设置  
-    - **第三重**：Application 的 `ActivityLifecycleCallbacks.onActivityResumed()` 回调中应用（直接设置，双重保险）  
-  - 调用 `ScreenshotProtectFeature.applyToActivity()`  
-    - 使用 `window.setFlags()` 直接设置，确保标志生效  
-  
-**技术细节**：  
-- 使用 `window.setFlags()` 而不是 `addFlags()`，确保 `FLAG_SECURE` 被正确设置  
-- 延迟设置机制：通过 `decorView.post()` 或 `Handler.postDelayed()` 确保窗口已创建  
-- 直接设置机制：在 `onActivityResumed()` 时窗口已稳定，可以直接设置  
-  
-#### 4.12.8 JNI 接口  
-  
-**JNI 方法注册**：  
-```cpp  // shell/src/main/cpp/dpt.cpp  static jboolean isScreenshotProtectEnabledJNI(__unused JNIEnv *env, jclass __unused) {    
-    return g_shell_config.screenshot_protect ? JNI_TRUE : JNI_FALSE;}    
-    
-static JNINativeMethod gMethods[] = {    
-// ... 其他方法    
-{"isScreenshotProtectEnabled", "()Z", (void *) isScreenshotProtectEnabledJNI},};  ```    
-**Java 层接口**：  
-```java  // shell/src/main/java/com/luoyesiqiu/shell/JniBridge.java  public static native boolean isScreenshotProtectEnabled();    
-```    
-#### 4.12.9 功能特点  
-  
-**优势**：  
-1. ✅ **解耦设计**：防截屏功能独立模块，不影响其他功能  
-2. ✅ **统一管理**：通过 `FeatureManager` 统一初始化和调用  
-3. ✅ **配置驱动**：通过命令行参数和 JSON 配置控制功能开关  
-4. ✅ **三重保险**：多时机应用保护，确保覆盖所有场景（延迟设置 + 直接设置）  
-5. ✅ **易于扩展**：新增功能只需添加新模块并在 `FeatureManager` 中注册  
-  
-**限制**：  
-- ✅ **已测试通过**：系统截屏快捷键（电源键+音量减）  
-- ✅ **已测试通过**：系统录屏功能  
-- ✅ **已测试通过**：Mumu 模拟器截屏  
-- ❌ **无法防止**：物理拍照（相机拍摄屏幕）  
-- ❌ **无法防止**：通过 ADB 命令截屏（`adb shell screencap`，需要 root 权限）  
-- ❌ **无法防止**：某些第三方截屏工具（如果它们有系统权限或 root 权限）  
-  
-**说明**：  
-- `FLAG_SECURE` 是 Android 系统级标志，只能防止系统级截屏和录屏  
-- 对于物理拍照、ADB 截屏等需要特殊权限的操作，无法防止  
-  
-#### 4.12.10 测试建议  
-  
-1. **功能测试**：  
-   - ✅ **系统截屏快捷键**：启用防截屏功能后，尝试使用电源键+音量减截屏，应提示"无法截屏"或"截屏失败"  
-   - ✅ **系统录屏功能**：尝试使用系统录屏功能，应无法录制受保护的 Activity  
-   - ✅ **模拟器测试**：在 Mumu、夜神等模拟器上测试截屏功能，应无法截屏  
-   - ✅ **多 Activity 测试**：测试应用内所有 Activity 是否都受到保护  
-  
-2. **兼容性测试**：  
-   - ✅ **Android 版本**：测试 Android 5.0+ 各版本（已验证 Android 12、13）  
-   - ✅ **厂商 ROM**：测试不同厂商 ROM（MIUI、ColorOS、OneUI、原生 Android 等）  
-   - ✅ **Activity 类型**：测试不同 Activity 类型（普通 Activity、Dialog Activity、透明 Activity、FragmentActivity 等）  
-  
-3. **性能测试**：  
-   - ✅ **启动速度**：验证应用启动速度不受影响  
-   - ✅ **切换流畅度**：验证 Activity 切换流畅度不受影响  
-   - ✅ **内存占用**：验证功能不会增加明显的内存占用  
-  
-4. **日志验证**：  
-   - 查看 logcat 中是否有 `[FEATURE]`、`[SCREENSHOT_PROTECT]` 相关日志  
-   - 确认功能管理器已正确初始化  
-   - 确认 `FLAG_SECURE` 已成功应用到所有 Activity  
-   - 日志示例：  
-```    
-     [FEATURE] Starting to initialize FeatureManager in ProxyComponentFactory...    
-[FEATURE] isScreenshotProtectEnabled() returned: true     [FEATURE] FeatureManager initialized successfully     [SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to xxx.Activity     ```  #### 4.12.11 参考资源  
-  
-- **Android FLAG_SECURE 文档**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE  
-- **Android 窗口标志**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams  
-  
-### 4.13 SharePreferences/SQLite 加密  
-  
-**实现思路**：  
-1. 自定义 SharedPreferences 和 SQLiteOpenHelper  
-2. 在读写时自动加密/解密  
-  
-**实现方案**：  
-- 使用 SQLCipher 加密数据库  
-- 使用 AES 加密 SharedPreferences  
-  
-**参考资料**：  
-- SQLCipher：https://www.zetetic.net/sqlcipher/  
-- Android 数据加密：https://developer.android.com/training/articles/keystore  
-  
----    
-  
-### 4.14 代理检测  
-  
-#### 4.14.1 实现思路  
-  
-代理检测旨在防止中间人攻击（MITM）和流量抓包分析。该功能通过 Native 层和 Java 层双重检测机制，识别常见的代理配置和拦截行为。当检测到代理时，App 会显示安全警告弹窗并强制退出。  
-  
-**检测方式**（综合 Native 和 Java）：  
-1.  **Native Socket 检测** ✅（已实现）：尝试连接特定 IP（1.1.1.1:443）并设置极短超时，检测连接行为异常。  
-2.  **系统属性检测 (Java)** ✅（已实现）：检查 `http.proxyHost` 和 `http.proxyPort` 系统属性。  
-3.  **VPN 状态检测 (Java)** ✅（已实现）：通过 `ConnectivityManager` 检测是否存在 VPN 类型的网络连接。  
-  
-#### 4.14.2 代码结构设计  
-  
-**文件位置**：  
-- `shell/src/main/cpp/dpt_risk.h`：添加函数声明  
-- `shell/src/main/cpp/dpt_risk.cpp`：实现 Native 检测逻辑  
-- `shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java`：实现 Java 检测逻辑及弹窗警告  
-- `shell/src/main/java/com/luoyesiqiu/shell/JniBridge.java`：JNI 接口  
-  
-#### 4.14.3 检测方式详解  
-  
-**方式 1：Native Socket 检测 (透明代理/中间人检测)**  原理：在极短的超时时间（300ms）内尝试连接公网 IP（如 1.1.1.1:443）。如果这导致了非预期的连接错误（即非网络不可达、超时等常规错误），则认为可能存在代理或流量拦截。  
-  
-*注意*：为了防止在 Root 设备或防火墙环境下误报，以下错误码会被**忽略**（即视为非代理）：  
-- `ENETUNREACH` (Network is unreachable)  
-- `ETIMEDOUT` (Connection timed out)  
-- `ECONNREFUSED` (Connection refused)  
-- `EHOSTUNREACH` (No route to host)  
-- `EACCES` (Permission denied, 如防火墙拦截)  
-- `EPERM` (Operation not permitted)  
-- `ENETDOWN` (Network is down)  
-- `EINTR` (Interrupted system call)  
-- `EINPROGRESS` (Operation now in progress)  
-- `EALREADY` (Operation already in progress)  
-  
-```cpp  // shell/src/main/cpp/dpt_risk.cpp  bool detectSocketProxyNative() {    
-int sock = socket(AF_INET, SOCK_STREAM, 0);    // ... 设置 300ms 超时 ...    int res = connect(sock, ..., sizeof(addr));    int err = errno;    close(sock);if (res != 0) {        // 忽略常见网络错误，避免误报    
-if (err == ENETUNREACH || err == ETIMEDOUT || err == EACCES || ...) {            return false;        }        return true; // 其他异常错误视为可疑    
-}    return false; // 连接成功视为正常  }  ```    
-**方式 2：系统属性检测 (显式代理配置)**  原理：读取 Android 系统属性 `http.proxyHost` 和 `http.proxyPort`。如果这两个属性不为空，说明用户在系统设置中配置了 HTTP 代理。  
-  
-```java  // ProxyComponentFactory.java  private static boolean checkSystemProxy() {    
-String host = System.getProperty("http.proxyHost");    String port = System.getProperty("http.proxyPort");    return !TextUtils.isEmpty(host) && !TextUtils.isEmpty(port);}    
-```    
-**方式 3：VPN 状态检测**  原理：使用 `ConnectivityManager` 检查当前激活的网络是否包含 `TRANSPORT_VPN` 能力。这可以检测到 VPN 应用（如抓包工具常见的 VPN 模式）。  
-  
-```java  // ProxyComponentFactory.java  private static boolean checkVpn() {    
-ConnectivityManager cm = ...;    Network activeNetwork = cm.getActiveNetwork();    NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);    return caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN);}    
-```    
-#### 4.14.4 警告与退出机制  
-  
-当检测到代理（任何一种方式命中）时，系统会触发警告流程：  
-1.  **UI 弹窗**：在当前最顶层的 Activity 显示不可取消的警告对话框。  
-2.  **强制退出**：用户点击“确定”或对话框显示后，应用会清除任务栈、杀掉进程并调用 `System.exit(0)`。  
-3.  **冲突处理**：如果 Root 检测已经触发了警告，代理检测的警告将被抑制，优先显示 Root 警告。  
-  
-  
-## 五、关键技术点总结  
-  
-### 5.1 Hook 框架  
-- **Dobby**：用于 Hook ART 内部函数（DefineClass）  
-- **bhook**：用于 Hook 系统库函数（mmap, execve）  
-  
-### 5.2 DEX 文件格式  
-- CodeItem 结构：16 字节头部 + insns 数组  
-- ClassData 结构：存储类的字段和方法信息  
-- 需要理解 DEX 文件格式才能正确提取和填回  
-  
-### 5.3 内存管理  
-- 使用 `mmap` Hook 使 DEX 内存可写  
-- 使用 `mprotect` 修改内存权限  
-  
-### 5.4 多版本兼容  
-- 支持 Android 5.0 - 14.0  
-- 不同版本 ART 结构体不同，需要适配  
-  
----    
-  
-## 六、参考资料  
-  
-1. **DEX 文件格式**：  
-   - https://source.android.com/devices/tech/dalvik/dex-format  
-  
-2. **ART 虚拟机**：  
-   - https://source.android.com/devices/tech/dalvik  
-  
-3. **Hook 技术**：  
-   - Dobby：https://github.com/jmpews/Dobby  
-   - bhook：https://github.com/bytedance/bhook  
-  
-4. **Android 安全**：  
-   - https://developer.android.com/training/articles/security-tips  
-  
-5. **加固技术**：  
-   - 看雪论坛：https://bbs.kanxue.com/  
-   - 安全客：https://www.anquanke.com/
+---  
+  
+## 2.3 DEX 处理详细流程  
+  
+在编译时处理阶段，DEX 文件会经过以下 7 个关键步骤的处理：  
+  
+### 步骤 1：extractDexCode - 提取 DEX 代码到资源目录  
+  
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::extractDexCode()`  
+  
+**处理过程**：  
+```java  
+// 1. 遍历所有 DEX 文件（classes.dex, classes2.dex...）  
+List<File> dexFiles = getDexFiles(getDexDir(packageDir));  
+  
+// 2. 如果需要保留部分类，先分割 DEXif (isKeepClasses()) {  
+    // 将 DEX 分为两部分：  
+    // - keepDex: 保留在 APK 中的类（匹配排除规则）  
+    // - splitDex: 需要保护的类（抽取代码）  
+    DexUtils.splitDex(dexFile, keepDex, splitDex);}  
+  
+// 3. 提取所有方法的 CodeItem（字节码）  
+List<Instruction> ret = DexUtils.extractAllMethods(  
+    dexFile, extractedDexFile, packageName, dumpCode, obfuscate);  
+// 4. 将提取的代码保存到 assets 目录  
+// 文件：assets/classes.dex.dat（MultiDexCode 格式）  
+MultiDexCodeUtils.writeMultiDexCode(dataOutputPath, multiDexCode);  
+```
+
+**目的**：
+- **抽取方法字节码**：将方法体替换为 return 语句或随机指令
+- **保存到 assets**：运行时从 assets 读取并填回
+- **隐藏真实代码**：APK 中不再包含原始字节码
+
+**结果**：
+- 原 DEX 文件：方法体被替换（空壳）
+- `assets/classes.dex.dat`：包含所有 CodeItem 数据
+
+---
+
+### 步骤 2：addJunkCodeDex - 添加垃圾代码 DEX
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::addJunkCodeDex()`
+
+**处理过程**：
+```java  
+// 将 junkcode.dex 添加到 DEX 目录  
+addDex(getJunkCodeDexPath(), getDexDir(packageDir));  
+// 例如：classes.dex, classes2.dex, junkcode.dex  
+```
+
+**目的**：
+- **反调试**：垃圾代码类包含检测逻辑
+- **混淆**：增加分析难度
+- **运行时检测**：在类加载时触发反调试检查
+
+**结果**：
+- DEX 目录中新增 `junkcode.dex`（包含垃圾代码类）
+
+---
+
+### 步骤 3：compressDexFiles - 压缩 DEX 文件
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::compressDexFiles()`
+
+**处理过程**：
+```java  
+// 1. 将所有 DEX 文件压缩成 ZIP（STORE 模式，不压缩）  
+Map<String, CompressionMethod> rulesMap = new HashMap<>();  
+rulesMap.put("classes\\d*.dex", CompressionMethod.STORE);  
+ZipUtils.compress(getDexFiles(getDexDir(packageDir)),   
+                  unalignedFilePath, rulesMap);  
+  
+// 2. 执行 zipalign 对齐（优化内存映射）  
+ZipAlign.alignZip(randomAccessFile, out);  
+  
+// 3. 保存到 assets 目录  
+// 文件：assets/classes.dex.zip  
+```
+
+**目的**：
+- **隐藏 DEX**：压缩后不易被直接提取
+- **对齐优化**：zipalign 提升加载性能
+- **统一管理**：多个 DEX 合并为一个 ZIP
+
+**结果**：
+- `assets/classes.dex.zip`：包含所有 DEX 文件（压缩包）
+
+---
+
+### 步骤 4：deleteAllDexFiles - 删除所有 DEX 文件
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::deleteAllDexFiles()`
+
+**处理过程**：
+```java  
+List<File> dexFiles = getDexFiles(getDexDir(packageDir));  
+for (File dexFile : dexFiles) {  
+    dexFile.delete();  // 删除所有 .dex 文件  
+}  
+```
+
+**目的**：
+- **清理**：删除已处理的 DEX（代码已抽取）
+- **防止泄露**：避免原始 DEX 残留在 APK 中
+- **准备合并**：为后续合并壳 DEX 做准备
+
+**结果**：
+- DEX 目录清空（所有 .dex 文件已删除）
+
+---
+
+### 步骤 5：combineDexZipWithShellDex - 将壳 DEX 与原 DEX 合并
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::combineDexZipWithShellDex()`
+
+**处理过程**：
+```java  
+// 1. 读取壳 DEX（ProxyApplication 等）  
+byte[] shellDex = readFile(getProxyDexPath());  
+  
+// 2. 读取压缩的 DEX ZIPbyte[] zipData = readFile(originalDexZipFile);  // assets/classes.dex.zip  
+  
+// 3. 合并：壳 DEX + ZIP 数据 + ZIP 长度（4字节）  
+byte[] newDexBytes = new byte[shellDexLen + zipDataLen + 4];  
+System.arraycopy(shellDex, 0, newDexBytes, 0, shellDexLen);  
+System.arraycopy(zipData, 0, newDexBytes, shellDexLen, zipDataLen);  
+System.arraycopy(intToByte(zipDataLen), 0, newDexBytes, totalLen-4, 4);  
+  
+// 4. 修复 DEX 头部（file_size, SHA1, CheckSum）  
+FileUtils.fixFileSizeHeader(newDexBytes);  
+FileUtils.fixSHA1Header(newDexBytes);  
+FileUtils.fixCheckSumHeader(newDexBytes);  
+  
+// 5. 生成新的 classes.dexwriteFile(targetDexFile, newDexBytes);  
+```
+
+**目的**：
+- **隐藏 ZIP**：将 ZIP 数据嵌入 DEX 尾部
+- **伪装**：看起来是普通 DEX，实际包含压缩包
+- **运行时提取**：从 DEX 尾部读取 ZIP 长度，提取压缩包
+
+**文件结构**：
+```  
+新的 classes.dex:┌─────────────────┐  
+│   壳 DEX 代码    │  ProxyApplication, JniBridge 等  
+├─────────────────┤  
+│   ZIP 数据      │  classes.dex.zip（原 DEX 文件）  
+├─────────────────┤  
+│   ZIP 长度(4B)  │  用于运行时定位 ZIP 起始位置  
+└─────────────────┘  
+```
+
+**运行时提取**（`shell/src/main/cpp/dpt_util.cpp`）：
+```cpp  
+// shell 运行时从 DEX 文件末尾读取 ZIP 长度  
+uint32_t zipLen = *(uint32_t*)(dexEnd - 4);  
+uint8_t* zipData = dexBegin + (dexSize - zipLen - 4);  
+// 解压 ZIP 得到原始 DEX 文件  
+```
+
+---
+
+### 步骤 6：addKeepDexes - 添加保留 DEX 文件
+
+**实现位置**：`dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::addKeepDexes()`
+
+**处理过程**：
+```java  
+File keepDexTempDir = getKeepDexTempDir(packageDir);  
+File[] files = keepDexTempDir.listFiles();  
+  
+// 将保留的 DEX 文件添加到 DEX 目录  
+for (File file : files) {  
+    if (file.getName().endsWith(".dex")) {        addDex(file.getAbsolutePath(), getDexDir(packageDir));    }}  
+```
+
+**目的**：
+- **保留部分类**：匹配排除规则的类保留在原始 DEX 中
+- **兼容性**：某些类需要直接可见（如系统组件）
+- **性能**：减少运行时填回的工作量
+
+**结果**：
+- 如果启用了 `keepClasses`，会添加 `classes2.dex`、`classes3.dex` 等保留的 DEX
+
+---
+
+### 步骤 7：删除临时保留 DEX 目录
+
+**处理过程**：
+```java  
+FileUtils.deleteRecurse(apk.getKeepDexTempDir(apkMainProcessPath));  
+```
+
+**目的**：
+- **清理临时文件**：删除处理过程中的临时目录
+
+---
+
+### DEX 处理流程总结
+
+```  
+原始 APK:├── classes.dex          (原始代码)  
+├── classes2.dex         (原始代码)  
+└── ...  
+  
+步骤 1: extractDexCode├── classes.dex          (代码已抽取，方法体为空)  
+├── classes2.dex         (代码已抽取，方法体为空)  
+└── assets/  
+    └── classes.dex.dat  (CodeItem 数据)  
+  
+步骤 2: addJunkCodeDex├── classes.dex          (代码已抽取)  
+├── classes2.dex         (代码已抽取)  
+└── junkcode.dex         (垃圾代码)  
+  
+步骤 3: compressDexFiles├── classes.dex          (代码已抽取)  
+├── classes2.dex         (代码已抽取)  
+├── junkcode.dex         (垃圾代码)  
+└── assets/  
+    ├── classes.dex.dat  (CodeItem 数据)  
+    └── classes.dex.zip  (压缩的 DEX 文件)  
+  
+步骤 4: deleteAllDexFiles└── assets/  
+    ├── classes.dex.dat  (CodeItem 数据)  
+    └── classes.dex.zip  (压缩的 DEX 文件)  
+  
+步骤 5: combineDexZipWithShellDex├── classes.dex          (壳 DEX + ZIP 数据)  
+└── assets/  
+    ├── classes.dex.dat  (CodeItem 数据)  
+    └── classes.dex.zip  (已删除)  
+  
+步骤 6: addKeepDexes (如果启用)  
+├── classes.dex          (壳 DEX + ZIP 数据)  
+├── classes2.dex         (保留的类，如果启用 keepClasses)└── assets/  
+    └── classes.dex.dat  (CodeItem 数据)  
+```
+
+### 为什么这样做？
+
+1. **代码隐藏**：原始字节码不在 APK 的 DEX 中，运行时动态填回，静态分析无法直接看到
+2. **混淆**：方法体被替换，增加逆向难度；垃圾代码增加干扰
+3. **保护**：ZIP 嵌入 DEX，隐藏压缩包；运行时从内存中提取，不落盘
+4. **兼容性**：保留部分类，确保系统组件正常工作；支持 MultiDex
+5. **性能**：zipalign 对齐优化加载；按需填回，减少内存占用
+
+---
+
+## 三、已实现功能的实现方式
+
+### 3.1 三代代码分离保护（核心功能）
+
+**实现位置**：
+- `dpt/src/main/java/com/luoye/dpt/util/DexUtils.java`
+- `shell/src/main/cpp/dpt_hook.cpp`
+
+**实现原理**：
+
+1. **编译时抽取**（DexUtils.extractMethod）：
+```java  
+// 1. 读取方法的 CodeItemCode code = dex.readCode(method);  
+int insnsOffset = method.getCodeOffset() + 16; // CodeItem 头部 16 字节  
+  
+// 2. 保存原始指令  
+byte[] byteCode = new byte[insnsCapacity * 2];  
+for (int i = 0; i < insnsCapacity; i++) {  
+    byteCode[i * 2] = outRandomAccessFile.readByte();    byteCode[i * 2 + 1] = outRandomAccessFile.readByte();}  
+  
+// 3. 替换为 return 语句或随机指令  
+if(obfuscateIns) {  
+    outRandomAccessFile.writeShort(insRandom.nextInt()); // 随机指令  
+} else {  
+    outRandomAccessFile.writeShort(0x0e); // nop 指令  
+}  
+outRandomAccessFile.write(returnByteCodes); // 写入 return  
+```
+
+2. **运行时填回**（dpt_hook.cpp::patchMethod）：
+```cpp  
+// 1. Hook DefineClass，拦截类加载  
+void* DefineClassV22(...) {  
+    patchClass(descriptor, dex_file, dex_class_def);    return g_originDefineClassV22(...);}  
+  
+// 2. 遍历类的所有方法  
+for (uint64_t i = 0; i < direct_methods_size; i++) {  
+    auto method = directMethods[i];    patchMethod(begin, location.c_str(), dexSize, dexIndex,                method.method_idx_delta_, method.code_off_);}  
+  
+// 3. 从内存中查找 CodeItem 并写回  
+void patchMethod(...) {  
+    // 计算 method_idx    uint32_t methodIdx = ...;    // 从 dexMap 查找  
+    auto codeItemVec = dexMap[dexIndex];    data::CodeItem *codeItem = codeItemVec->at(methodIdx);    // 计算 insns 位置  
+    uint8_t *insns = begin + code_off + 16;    // 写回字节码  
+    memcpy(insns, codeItem->getInsns(), codeItem->getInsnsSize());}  
+```
+
+### 3.2 指令混淆
+
+**实现位置**：`DexUtils.extractMethod()`
+
+**实现原理**：
+- 默认模式：用 `0x0e` (nop) 填充
+- 混淆模式：用随机数填充（`insRandom.nextInt()`）
+- 增加逆向分析难度
+
+### 3.3 垃圾代码生成与保护
+
+**实现位置**：
+- `dpt/src/main/java/com/luoye/dpt/dex/JunkCodeGenerator.java`
+- `shell/src/main/cpp/dpt_hook.cpp::patchClass()`
+
+**实现原理**：
+
+1. **生成垃圾类**：
+```java  
+// 生成 50-100 个垃圾类  
+for(int i = 0; i < generateClassCount; i++) {  
+    // 每个类包含：  
+    // - <clinit>：调用 System.exit(0)    // - <init>：调用 System.exit(0)    // - 随机方法：System.exit(0) 或抛出 NullPointerException}  
+```
+
+2. **运行时检测**：
+```cpp  
+// 检测垃圾类是否被非法调用  
+if(descriptor 包含 junkClassName) {    char ch = descriptor[descriptorLength - 2];    if(isdigit(ch)) {  // 如果类名包含数字（说明被调用）  
+        dpt_crash();  // 崩溃  
+    }}  
+```
+
+### 3.4 SO 文件加密
+
+**实现位置**：
+- `dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java::encryptSoFile()`
+- `shell/src/main/cpp/dpt.cpp::decrypt_bitcode()`
+
+**实现原理**：
+
+1. **编译时加密**：
+```java  
+// 读取 .bitcode 段  
+ReadElf readElf = new ReadElf(soFile);  
+List<SectionHeader> sections = readElf.getSectionHeaders();  
+for (SectionHeader section : sections) {  
+    if (".bitcode".equals(section.getName())) {        byte[] bitcode = IoUtils.readFile(soFile, section.getOffset(), section.getSize());        byte[] enc = CryptoUtils.rc4Crypt(rc4Key, bitcode);  // RC4 加密  
+        IoUtils.writeFile(soFile, enc, section.getOffset());    }}  
+```
+
+2. **运行时解密**：
+```cpp  
+// 在 .init_array 中解密  
+void decrypt_bitcode() {  
+    // 1. 获取 SO 文件路径  
+    Dl_info info;    dladdr((void*)decrypt_bitcode, &info);    // 2. 读取 .bitcode 段  
+    Elf_Shdr shdr;    get_elf_section(&shdr, so_path, ".bitcode");    // 3. 修改内存权限为可写  
+    dpt_mprotect(target, target + size, PROT_READ | PROT_WRITE | PROT_EXEC);    // 4. RC4 解密  
+    rc4_init(&dec_state, key, 16);    rc4_crypt(&dec_state, target, bitcode, size);    memcpy(target, bitcode, size);    // 5. 恢复内存权限  
+    dpt_mprotect(target, target + size, PROT_READ | PROT_EXEC);}  
+```
+
+### 3.5 全方位 Hook 与注入防御体系 (Omni-Hook Protection)
+
+**实现位置**：`shell/src/main/cpp/dpt_risk.cpp`
+
+**核心架构**：
+采用 **"双进程守护 + 多特征扫描 + 瞬时阻断"** 的立体防御架构。我们不仅仅拦截 Frida，而是实现了一个针对主流 Hook 框架、注入技术和调试器的全谱系防御网。
+
+#### 3.5.0 防御覆盖范围 (Coverage Matrix)
+
+**1. 动态注入框架 (Dynamic Instrumentation)**
+
+| 框架 | 检测方式 | 覆盖情况 |
+| :--- | :--- | :--- |
+| **Frida** | 线程名 (`gum-js-loop`, `pool-frida`) + SO 库 (`frida-agent.so`) | ✅ **已覆盖 (秒级强杀)** |
+| **Xposed** | 文件路径 (`XposedBridge.jar`) + 内存 Maps + 调用栈符号 (`de.robv.android.xposed`) | ✅ **已覆盖 (强杀)** |
+| **EdXposed** | 文件路径 (`libedxposed.so`) + 调用栈符号 | ✅ **已覆盖 (强杀)** |
+| **LSPosed** | 文件路径 (`lspd`, `modules`) + 调用栈符号 (`LspHooker`) | ✅ **已覆盖 (强杀)** |
+| **Cydia Substrate** | 文件路径 (`libsubstrate.so`) + 内存 Maps | ✅ **已覆盖 (强杀)** |
+
+**2. 注入式 Hook (Injection Hook)**
+
+| 框架 | 检测方式 | 覆盖情况 |
+| :--- | :--- | :--- |
+| **Riru** | 文件/内存特征 (`libriru.so`, `/data/misc/riru`) | ✅ **已覆盖 (强杀)** |
+| **Zygisk** | 间接覆盖 (通过检测其加载的模块如 LSPosed/Frida，本身特征较隐蔽) | ⚠️ 部分覆盖 |
+| **SandHook** | 符号检测 (`sandhook`) + 指令特征 | ✅ **已覆盖 (强杀)** |
+
+**3. Native Inline Hook**
+
+| 攻击方式 | 检测方式 | 覆盖情况 |
+| :--- | :--- | :--- |
+| **GOT Hook** | 未专门实现 (通常被当作 Inline Hook 或完整性校验的一部分) | ❌ 未覆盖 |
+| **Inline Hook** | 扫描 `libc` 关键函数 (`open`, `read`, `dlsym` 等) 的前 8 字节是否为跳转指令 (`B`, `LDR`, `BR`) | ✅ **已覆盖 (强杀)** |
+
+**4. 调试器 (Debugger)**
+
+| 工具 | 检测方式 | 覆盖情况 |
+| :--- | :--- | :--- |
+| **IDA Pro / GDB** | `ptrace` (双进程守护 + `PTRACE_TRACEME` 占坑) + 父子进程互相监控 | ✅ **已覆盖 (强杀)** |
+
+#### 3.5.1 整体防御流程
+1.  **启动阶段 (JNI_OnLoad)**：读取加密配置，注册 JNI 方法 (修复了方法签名缺失的隐患)，启动延迟线程。
+2.  **进程分裂 (Dual-Process)**：延迟调用 `createAntiRiskProcess()`，执行 `fork()`。
+    *   **主进程**：运行核心检测逻辑 (Maps/Threads/Root)，同时监控子进程存活。
+    *   **子进程**：执行 `ptrace(PTRACE_TRACEME)` 抢占调试端口，防止 Frida/IDA 附加；同时作为冗余检测节点。
+3.  **检测运行模型（以当前代码为准）**：
+    *   **Frida**：通过后台线程 `detectFridaOnThread` **1s/次**循环扫描（maps + threads）。
+    *   **ROOT/Proxy**：各自有后台检测线程，**10s/次**轮询；同时在启动时会立即检测一次。
+    *   **Xposed/HookFramework + InlineHook**：当前为**一次性检测**（在 `createAntiRiskProcess()` 入口按配置执行；子进程也会做 HookFramework 检测，但 InlineHook 默认只在主流程做一次）。
+4.  **异常处置**：一旦命中特征，调用 `dpt_crash()` (SIGKILL) 强杀进程。
+
+#### 3.5.2 Frida 专项检测 (In-Process Detection)
+**检测函数**：`detectFridaOnThread`
+**扫描频率**：1s/次 (高危防护)
+
+1.  **内存映射扫描 (Maps Detection)**：
+    *   读取 `/proc/self/maps`，查找 `frida-agent*.so` 等特征动态库。
+    *   **关键改进**：缓冲区已扩容至 **2048 字节**，解决了 Uniapp 等框架产生的超长文件路径导致的读取截断/溢出问题。
+2.  **线程特征扫描 (Thread Detection)**：
+    *   遍历 `/proc/self/task`，检查所有线程名称。
+    *   黑名单：`gum-js-loop`, `gmain`, `gdbus`, `pool-frida`。
+    *   逻辑：如果发现上述特征线程数量 >= 2，立即判定为 Frida 注入。
+
+#### 3.5.3 Xposed 与 Hook 框架检测
+**检测函数**：`detectHookFramework`
+
+当前实现以 **Native 层检测** 为主，核心目标是检测 Xposed/LSPosed/Substrate/Riru/EdXposed 等 Hook 框架痕迹：
+
+1.  **文件痕迹检测**：检查典型安装路径/注入产物是否存在（如 `XposedBridge.jar`、`/data/adb/lspd`、`/data/adb/modules/riru_edxposed` 等）。
+2.  **Map 检测**：扫描 `/proc/self/maps`，查找 `XposedBridge.jar` / `libxposed` / `libsubstrate` / `libriru` / `edxp` / `sandhook` 等关键字。
+3.  **Native 堆栈检测**：使用 `_Unwind_Backtrace` + `dladdr` 遍历 native 调用栈符号，查找 `Xposed` / `LspHooker` / `Substrate` / `edxposed` / `riru` / `sandhook` 等特征。
+
+> 注意：当前项目代码实现的是 **Native 调用栈符号扫描**（`_Unwind_Backtrace` + `dladdr`），并**没有实现 Java 层调用栈扫描**（例如 `Thread.getStackTrace()` / `Throwable().getStackTrace()`）。“Java 调用栈扫描 / Native 桥注册检测”可作为后续可选增强方向。
+
+#### 3.5.4 Inline Hook 检测
+**检测函数**：`detectInlineHook` (部分实现)
+
+*   **原理**：扫描常见系统函数（如 `libc.so` 中的 `open`, `read`, `mmap` 等）的函数头前几个字节。
+*   **特征**：检查是否被修改为跳转指令 (比如 ARM 的 `LDR PC, ...` 或 Thumb 的 `B ...`)。如果函数头被篡改，说明存在挂钩。
+
+##### 3.5.4.1 风险与注意事项（非常重要）
+Inline Hook 检测属于“启发式（heuristic）”策略，**误报成本非常高**（一旦误报，通常会直接触发 `dpt_crash()`，用户表现为卡启动/闪退/无提示退出）。因此需要特别注意：
+
+1. **不能仅凭指令形态判定 Hook**  
+   特别是 ARM64 下的 `ADRP + ADD` 在大量正常函数开头都可能出现（取全局地址/常量池/TLS），如果把 `ADRP+ADD` 当作 trampoline，将导致 **大量真机误报**。
+
+2. **建议补充“跳转目标校验”以降低误报**（后续优化方向）  
+   对于 `B <imm>` / `LDR + BR` 等模式，建议解析跳转目标或读取被加载的目标地址，并校验目标是否仍落在合法的 `libc.so` `.text` 范围内（`dladdr`/maps 结合判断）。  
+   - **跳到库外 / 跳到匿名可执行段**：更像 Hook（强信号）  
+   - **仍在本库 text**：大概率正常（弱信号或忽略）
+
+3. **建议分级处理，避免“一刀切 kill”**  
+   Inline Hook 检测更适合做“强信号 + 多信号组合”的一环，而不是单点命中就强杀。建议后续结合 `detectHookFramework()`、ROOT、Frida 等结果进行分级：Warn / Block。
+
+4. **与壳自身 Hook/兼容性冲突需要隔离**  
+   项目自身会使用 bytehook/Dobby 对 ART/系统函数做 Hook（用于防护与填回），因此检测策略必须避免把“壳自身的 Hook 行为”当成攻击行为。建议对“壳主动 Hook 的函数/库”做白名单或跳过规则（后续优化方向）。
+
+#### 3.5.5 反调试占坑 (Anti-Debug)
+**实现函数**：`doPtrace` (运行于子进程)
+
+```cpp
+void doPtrace() {
+    // 抢占 PTRACE_TRACEME，利用 Linux 内核 "同一时间只能有一个调试器" 的特性
+    // 导致 Frida -f 或 gdb 无法再 attach 上去
+    ptrace(PTRACE_TRACEME, 0, 0, 0);
+}
+```
+
+#### 3.5.6 配置与参数
+所有检测开关均通过加密配置文件 (`shell_config.json`) 动态控制，可在打包时通过参数开启/关闭：
+*   `frida_detect`: 默认开启
+*   `xposed_detect`: 可选
+*   `hook_detect`: 可选（Inline Hook 检测，启发式策略，需谨慎开启，见 3.5.4.1）
+*   `root_detect`: 可选 (轮询间隔 10s)
+*   `proxy_detect`: 可选 (轮询间隔 10s)  
+
+### 3.6 子进程反调试
+
+**实现位置**：`shell/src/main/cpp/dpt_risk.cpp`
+
+**实现原理**：
+```cpp  
+void createAntiRiskProcess() {  
+    // 说明：以下为简化示意，具体以 dpt.cpp 中的 createAntiRiskProcess() 为准。
+    // 当前实现特点：
+    // 1) fork 前：可按配置执行 ROOT/Proxy/HookFramework/InlineHook 的一次性检测
+    // 2) fork 后：
+    //   - 主进程：protectChildProcess(child) + detectFrida()（启动 1s 轮询线程）
+    //   - 子进程：doPtrace() 占坑，并保持进程存活（sleep 循环）
+    pid_t child = fork();
+    if(child == 0) {
+        doPtrace();
+        while(true) { sleep(60); }
+    } else {
+        protectChildProcess(child);
+        detectFrida();
+    }
+}  
+  
+void* protectProcessOnThread(void* args) {  
+    pid_t child = *((pid_t*)args);    int pid = waitpid(child, nullptr, 0);    if(pid > 0) {  // 子进程被调试器 attach 会退出  
+        dpt_crash();    }}  
+```
+
+### 3.7 execve Hook（阻止 dex2oat）
+
+**实现位置**：`shell/src/main/cpp/dpt_hook.cpp`
+
+**实现原理**：
+```cpp  
+int fake_execve(const char *pathname, char *const argv[], char *const envp[]) {  
+    if (strstr(pathname, "dex2oat") != nullptr) {        errno = EACCES;        return -1;  // 阻止 dex2oat 执行  
+    }    return BYTEHOOK_CALL_PREV(fake_execve, pathname, argv, envp);}  
+```
+
+### 3.8 字符串混淆
+
+**实现位置**：`shell/src/main/cpp/common/obfuscate.h`
+
+**实现原理**：
+- 编译时使用 XOR 加密字符串
+- 运行时自动解密
+- 防止字符串在二进制文件中可见
+
+### 3.9 mmap Hook（使 DEX 可写）
+
+**实现位置**：`shell/src/main/cpp/dpt_hook.cpp`
+
+**实现原理**：
+```cpp  
+void* fake_mmap(void* __addr, size_t __size, int __prot, int __flags, int __fd, off_t __offset) {  
+    int hasRead = (__prot & PROT_READ) == PROT_READ;    int hasWrite = (__prot & PROT_WRITE) == PROT_WRITE;        if(hasRead && !hasWrite) {  
+        prot = prot | PROT_WRITE;  // 添加写权限  
+    }        return BYTEHOOK_CALL_PREV(fake_mmap, __addr, __size, prot, __flags, __fd, __offset);  
+}  
+```
+
+---
+
+## 四、未实现功能的实现思路
+
+### 4.1 二代 DEX 整体加密保护
+
+**实现思路**：
+1. 编译时：使用 AES 加密整个 DEX 文件
+2. 运行时：在 ClassLoader 加载 DEX 前解密
+3. 参考：https://github.com/luoyesiqiu/dpt-shell/issues
+
+**关键技术点**：
+- Hook `DexFile.openDexFile()` 或 `DexFile.loadDex()`
+- 在内存中解密 DEX 后再传递给系统
+
+### 4.2 文件完整性校验（v3 已落地）
+
+本方案用于识别对 APK 核心组件（DEX、CodeItem、加密资源包、Native 壳 SO）的非法篡改。
+
+#### 4.2.1 设计目标
+- **全量保护**：覆盖代码、核心数据和加密资源。
+- **动态复核**：除了启动时校验，还引入后台周期性校验，对抗运行时补丁。
+- **抗绕过**：哈希指纹受 HMAC-SHA256 保护，且在 Native 层执行流式校验。
+
+#### 4.2.2 校验范围
+dpt 工具在打包时会自动计算以下文件的 SHA-256：
+1.  `classes.dex`（壳 DEX）
+2.  `assets/OoooooOooo`（CodeItem 核心数据）
+3.  `assets/i11111i111.zip`（加密的原始 DEX 包）
+4.  `assets/.dpt/enc/assets.pack`（如果启用了资源加密）
+5.  `assets/vwwwwwvwww/{abi}/*.so`（所有架构的 Native 壳核心 SO）
+
+#### 4.2.3 核心机制
+1.  **启动校验**：在 `createAntiRiskProcess()` 早期执行一次全量同步校验。
+2.  **周期校验**：在 Native 层启动 `detectFileIntegrityPeriodicThread` 后台线程，每隔 **5 分钟**自动复核一次文件哈希。
+3.  **流式哈希**：使用 `minizip-ng` 流式读取 APK 中的 entry，并配合 `mbedtls` 计算 SHA-256，内存占用极低。
+4.  **处置策略**：
+    - 若判定为 `tampered` 且策略为 `block`，触发 Java 弹窗退出并启动 Native 延迟崩溃（同签名校验链路）。
+
+#### 4.2.4 测试方案
+1.  **静态篡改测试**：使用 MT 管理器修改 `assets.pack` 或替换一个 `.so` 文件，重新签名后运行，应用应在启动时拦截。
+2.  **运行时篡改测试**：应用启动后，尝试通过 root 权限或 adb 替换 `/data/app/.../base.apk` 里的内容（模拟动态替换），约 5 分钟内应用应触发延迟崩溃或拦截。
+
+#### 4.2.5 可观测性日志
+- `[FILE_INTEGRITY] starting periodic check...`：后台复核开始。
+- `[FILE_INTEGRITY] ok: classes.dex`：单个条目校验通过。
+- `[FILE_INTEGRITY] mismatch: {name}, expect=..., got=...`：检测到篡改。
+
+### 4.3 ROOT 检测
+
+#### 4.3.1 实现思路
+
+ROOT 检测应该采用**多层次、多方式**的综合检测策略，参考现有的 `detectFrida()` 实现方式，在 `dpt_risk.cpp` 中实现。
+
+**检测方式**（共 13 种，当前 10 种已启用，3 种已禁用）：
+1. **文件系统检测** ✅：检测 su 文件、Magisk 文件、root 管理应用、KernelSU 文件
+2. **系统属性检测** ✅：检测 `ro.build.tags`、`ro.secure` 等属性
+3. **环境变量检测** ✅：检测 PATH 中的 su
+4. **SELinux 状态检测** ✅：检测 SELinux 是否被禁用
+5. **KernelSU 专项检测**：检测内核级 ROOT 方案（KernelSU）
+    - 检测 KernelSU 文件路径 ✅
+    - 检测进程 UID（/proc/self/status）✅
+    - 检测系统分区挂载状态（/proc/mounts）❌ **已禁用（容易误报）**
+    - 检测内核符号表（/proc/kallsyms）❌ **已禁用（容易误报）**
+    - 检测内核模块（/proc/modules）✅ **已优化**
+    - 检测 SELinux 状态文件（/sys/fs/selinux/status）✅
+    - 尝试执行 su 命令 ❌ **已禁用（可能阻塞）**
+
+#### 4.3.2 代码结构设计
+
+**文件位置**：
+- `shell/src/main/cpp/dpt_risk.h`：添加函数声明
+- `shell/src/main/cpp/dpt_risk.cpp`：实现检测逻辑
+- `shell/src/main/cpp/dpt.cpp`：集成到 `createAntiRiskProcess()`
+
+**函数设计**：
+```cpp  
+// dpt_risk.h  
+void detectRoot();  // 启动 ROOT 检测  
+  
+// dpt_risk.cpp  
+bool isRooted();  // 检测设备是否已 ROOTvoid* detectRootOnThread(void* args);  // 后台检测线程  
+```
+
+#### 4.3.3 检测方式详解
+
+**方式 1：检测 su 文件路径**
+```cpp  
+const char *su_paths[] = {  
+    "/system/bin/su",    "/system/xbin/su",    "/sbin/su",    "/vendor/bin/su",    "/data/local/su",    "/data/local/bin/su",    "/data/local/xbin/su",    "/system/sbin/su",    "/system/bin/failsafe/su",    "/system/xbin/daemonsu",    "/system/etc/init.d/99SuperSUDaemon",    "/dev/com.koushikdutta.superuser.daemon/",    "/system/app/Superuser.apk",    "/system/app/SuperSU.apk",    nullptr};  
+  
+for (int i = 0; su_paths[i] != nullptr; i++) {  
+    if (access(su_paths[i], F_OK) == 0) {        return true;    }}  
+```
+
+**方式 2：检测 Magisk 相关文件**
+```cpp  
+const char *magisk_paths[] = {  
+    "/sbin/magisk",    "/system/bin/magisk",    "/system/xbin/magisk",    "/data/adb/magisk",    "/cache/magisk.log",    "/data/adb/magisk.db",    "/data/adb/modules",    nullptr};  
+```
+
+**方式 3：检测系统属性**
+```cpp  
+char prop_value[256] = {0};  
+  
+// 检测 ro.build.tags（test-keys 表示测试版本）  
+if (__system_property_get("ro.build.tags", prop_value) > 0) {  
+    if (strstr(prop_value, "test-keys") != nullptr) {        return true;    }}  
+  
+// 检测 ro.debuggable（调试版本，可能更容易 ROOT）  
+prop_value[0] = '\0';  
+if (__system_property_get("ro.debuggable", prop_value) > 0) {  
+    if (strcmp(prop_value, "1") == 0) {        // 注意：仅 ro.debuggable=1 不一定表示 ROOT，可作为参考  
+    }}  
+  
+// 检测 ro.secure（安全模式）  
+prop_value[0] = '\0';  
+if (__system_property_get("ro.secure", prop_value) > 0) {  
+    if (strcmp(prop_value, "0") == 0) {        return true;  // ro.secure=0 通常表示已 ROOT    }}  
+```
+
+**方式 4：检测 root 管理应用数据目录（包括 KernelSU）**
+```cpp  
+const char *root_app_paths[] = {  
+    "/data/data/com.noshufou.android.su",    "/data/data/com.thirdparty.superuser",    "/data/data/eu.chainfire.supersu",    "/data/data/com.topjohnwu.magisk",    "/data/data/com.kingroot.kinguser",    "/data/data/com.kingo.root",    "/data/data/com.smedialink.oneclickroot",    "/data/data/com.zhiqupk.root.global",    "/data/data/com.alephzain.framaroot",    "/data/data/com.devadvance.rootcloak",    "/data/data/com.devadvance.rootcloakplus",    // KernelSU 相关应用  
+    "/data/data/com.omarea.vtools",      // KernelSU Manager    "/data/data/me.weishu.kernelsu",    "/data/data/com.kernelsu.manager",    nullptr};  
+```
+
+**方式 5：检测 PATH 环境变量中的 su**
+```cpp  
+FILE *fp = popen("which su", "r");  
+if (fp != nullptr) {  
+    char result[256] = {0};    if (fgets(result, sizeof(result), fp) != nullptr) {        if (strlen(result) > 0 && result[0] != '\n') {            pclose(fp);            return true;        }    }    pclose(fp);}  
+```
+
+**方式 6：检测 SELinux 状态**
+```cpp  
+// 通过 getenforce 命令检测  
+FILE *fp = popen("getenforce", "r");  
+if (fp != nullptr) {  
+    char result[16] = {0};    if (fgets(result, sizeof(result), fp) != nullptr) {        if (strstr(result, "Disabled") != nullptr) {            pclose(fp);            return true;  // SELinux 被禁用，可能已 ROOT        }    }    pclose(fp);}  
+```
+
+**方式 7：检测 KernelSU 相关文件路径**
+```cpp  
+// KernelSU 是内核级 ROOT 方案，会在特定路径留下痕迹  
+const char *kernelsu_paths[] = {  
+    "/data/adb/ksu",    "/data/adb/modules/ksu",    "/data/adb/ksud",    "/dev/kernelsu",    "/sys/fs/kernelsu",    "/proc/sys/kernel/kernelsu",    nullptr};  
+  
+for (int i = 0; kernelsu_paths[i] != nullptr; i++) {  
+    if (access(kernelsu_paths[i], F_OK) == 0) {        return true;    }}  
+```
+
+**方式 8：检测 /proc/self/status 中的 UID（KernelSU 可能通过内核修改 UID）**
+```cpp  
+// 读取当前进程的状态信息  
+FILE *fp = fopen("/proc/self/status", "r");  
+if (fp != nullptr) {  
+    char line[256] = {0};    while (fgets(line, sizeof(line), fp) != nullptr) {        // 查找 Uid 行：Uid:    1000    1000    1000    1000  
+        // 如果第一个 UID 为 0，说明当前进程有 root 权限  
+        if (strncmp(line, "Uid:", 4) == 0) {            unsigned int uid = 0;            if (sscanf(line + 4, "%u", &uid) == 1) {                if (uid == 0) {                    fclose(fp);                    return true;  // 检测到 root UID                }            }        }    }    fclose(fp);}  
+```
+
+**方式 9：检测 /proc/mounts 中系统分区是否被重新挂载为可读写**
+```cpp  
+// KernelSU 可能修改系统分区挂载状态  
+FILE *fp = fopen("/proc/mounts", "r");  
+if (fp != nullptr) {  
+    char line[512] = {0};    while (fgets(line, sizeof(line), fp) != nullptr) {        // 检查 /system 分区是否被重新挂载为可读写  
+        // 正常情况下 /system 应该是 ro（只读），如果看到 rw（读写）可能是 ROOT        if (strstr(line, "/system") != nullptr) {            if (strstr(line, " rw,") != nullptr ||                strstr(line, " rw ") != nullptr) {  
+                fclose(fp);                return true;            }        }        // 检查 /vendor 分区  
+        if (strstr(line, "/vendor") != nullptr) {            if (strstr(line, " rw,") != nullptr ||                strstr(line, " rw ") != nullptr) {  
+                fclose(fp);                return true;            }        }    }    fclose(fp);}  
+```
+
+**方式 10：检测 /proc/kallsyms 是否可读且包含有效内容**
+```cpp  
+// 正常情况下普通应用无法读取内核符号表  
+// 如果能读取有效的内核符号，可能是 ROOT（KernelSU 可能允许读取）  
+FILE *fp = fopen("/proc/kallsyms", "r");  
+if (fp != nullptr) {  
+    char line[256] = {0};    int valid_lines = 0;    // 读取前几行，检查是否包含有效的内核符号  
+    for (int i = 0; i < 5 && fgets(line, sizeof(line), fp) != nullptr; i++) {        // 检查是否包含有效的内核符号格式（地址 + 类型 + 符号名）  
+        if (strlen(line) > 20) {            if ((line[0] >= '0' && line[0] <= '9') ||                (line[0] >= 'a' && line[0] <= 'f')) {  
+                // 检查是否包含符号名（通常在地址和类型之后）  
+                for (int j = 0; j < (int)strlen(line) - 1; j++) {                    if (line[j] == ' ' && line[j+1] != ' ' && line[j+1] != '\n') {                        valid_lines++;                        break;                    }                }            }        }    }    fclose(fp);    // 如果能读取到有效的内核符号，可能是 ROOT    if (valid_lines >= 2) {        return true;    }}  
+```
+
+**方式 11：检测 /proc/modules 中是否有 KernelSU 相关的内核模块**
+```cpp  
+// KernelSU 通过内核模块实现，会在 /proc/modules 中显示  
+FILE *fp = fopen("/proc/modules", "r");  
+if (fp != nullptr) {  
+    char line[512] = {0};    while (fgets(line, sizeof(line), fp) != nullptr) {        // 检查是否有 KernelSU 相关的模块  
+        if (strstr(line, "kernelsu") != nullptr ||            strstr(line, "ksu") != nullptr) {            fclose(fp);            return true;        }    }    fclose(fp);}  
+```
+
+**方式 12：检测 /sys/fs/selinux/status（KernelSU 可能修改 SELinux 状态）**
+```cpp  
+// 读取 SELinux 状态文件  
+FILE *fp = fopen("/sys/fs/selinux/status", "r");  
+if (fp != nullptr) {  
+    char status[16] = {0};    if (fgets(status, sizeof(status), fp) != nullptr) {        // 移除换行符  
+        size_t len = strlen(status);        if (len > 0 && status[len - 1] == '\n') {            status[len - 1] = '\0';        }        // 如果 SELinux 状态为 disabled，可能是 ROOT        if (strcmp(status, "disabled") == 0) {            fclose(fp);            return true;        }    }    fclose(fp);}  
+```
+
+**方式 13：尝试执行 su 命令检测（KernelSU 可能提供 su 命令）**
+```cpp  
+// 使用 timeout 避免阻塞，如果 su 不存在或需要用户确认，timeout 会快速返回  
+FILE *fp = popen("timeout 1 su -c 'id' 2>/dev/null", "r");  
+if (fp != nullptr) {  
+    char result[256] = {0};    if (fgets(result, sizeof(result), fp) != nullptr) {        // 如果返回了 uid=0，说明有 root 权限  
+        if (strstr(result, "uid=0") != nullptr) {            pclose(fp);            return true;        }    }    pclose(fp);}  
+```
+
+#### 4.3.4 已实现的检测功能清单
+
+**当前实现状态**（共 13 种检测方式，其中 10 种已启用，3 种已禁用）：
+
+| 方式 | 检测内容 | 状态 | 说明 |  
+|------|---------|------|------|  
+| 方式 1 | 检测 su 文件路径（15 个常见路径） | ✅ 已启用 | 检测传统 ROOT 工具的 su 文件 |  
+| 方式 2 | 检测 Magisk 相关文件（7 个路径） | ✅ 已启用 | 检测 Magisk ROOT 方案 |  
+| 方式 3 | 检测系统属性（ro.build.tags, ro.secure） | ✅ 已启用 | 检测系统属性异常 |  
+| 方式 4 | 检测 root 管理应用数据目录（包括 KernelSU 应用） | ✅ 已启用 | 检测已安装的 ROOT 管理应用 |  
+| 方式 5 | 检测 PATH 环境变量中的 su | ✅ 已启用 | 检测 PATH 中的 su 命令 |  
+| 方式 6 | 检测 SELinux 状态（getenforce） | ✅ 已启用 | 检测 SELinux 是否被禁用 |  
+| 方式 7 | 检测 KernelSU 相关文件路径（7 个路径） | ✅ 已启用 | 检测 KernelSU 特有文件 |  
+| 方式 8 | 检测进程 UID（/proc/self/status） | ✅ 已启用 | 检测当前进程是否有 root UID |  
+| 方式 9 | 检测系统分区挂载状态（/proc/mounts） | ❌ **已禁用** | **容易误报，已禁用** |  
+| 方式 10 | 检测内核符号表（/proc/kallsyms） | ❌ **已禁用** | **容易误报，已禁用** |  
+| 方式 11 | 检测内核模块（/proc/modules） | ✅ 已启用 | 检测 KernelSU 内核模块（已优化） |  
+| 方式 12 | 检测 SELinux 状态文件（/sys/fs/selinux/status） | ✅ 已启用 | 检测 SELinux 状态文件 |  
+| 方式 13 | 尝试执行 su 命令 | ❌ **已禁用** | **可能阻塞，已禁用** |  
+
+**核心检测函数**：
+```cpp  
+/**  
+ * 检测设备是否已 ROOT * 综合多种检测方式，提高准确性  
+ * @return true 如果检测到 ROOT，false 否则  
+ */DPT_ENCRYPT bool isRooted() {  
+    // 方式 1：检测 su 文件路径（15 个常见路径）✅  
+    // 方式 2：检测 Magisk 相关文件（7 个路径）✅  
+    // 方式 3：检测系统属性（ro.build.tags, ro.secure）✅  
+    // 方式 4：检测 root 管理应用数据目录（包括 KernelSU 应用）✅  
+    // 方式 5：检测 PATH 环境变量中的 su ✅  
+    // 方式 6：检测 SELinux 状态（getenforce）✅  
+    // 方式 7：检测 KernelSU 相关文件路径（7 个路径）✅  
+    // 方式 8：检测 /proc/self/status 中的 UID ✅  
+    // 方式 9：检测 /proc/mounts 中系统分区挂载状态 ❌ 已禁用（容易误报）  
+    // 方式 10：检测 /proc/kallsyms 可读性 ❌ 已禁用（容易误报）  
+    // 方式 11：检测 /proc/modules 中的内核模块 ✅（已优化）  
+    // 方式 12：检测 /sys/fs/selinux/status ✅  
+    // 方式 13：尝试执行 su 命令 ❌ 已禁用（可能阻塞）  
+    // 如果任一方式检测到 ROOT，返回 true    return false;}  
+```
+
+**后台检测线程**：
+```cpp  
+/**  
+ * ROOT 检测线程（持续运行）  
+ * 定期检测设备 ROOT 状态  
+ */[[noreturn]] DPT_ENCRYPT void *detectRootOnThread(__unused void *args) {  
+    while (true) {        if (isRooted()) {            // 1) 置位 ROOT 检测标志（供 Java 层查询并弹窗告警）  
+            // 2) 启动延迟退出（避免“秒崩无提示”）  
+            mark_root_detected();            schedule_root_delayed_crash_once();        }        sleep(10);  // 每 10 秒检测一次  
+    }}  
+```
+
+**启动检测函数**：
+```cpp  
+/**  
+ * 启动 ROOT 检测  
+ * 1. 立即检测一次  
+ * 2. 启动后台检测线程  
+ */DPT_ENCRYPT void detectRoot() {  
+    // 立即检测一次  
+    if (isRooted()) {        // 1) 置位 ROOT 检测标志（供 Java 层查询并弹窗告警）  
+        // 2) 启动延迟退出（避免“秒崩无提示”）  
+        mark_root_detected();        schedule_root_delayed_crash_once();        return;    }    // 启动后台检测线程  
+    pthread_t t;    pthread_create(&t, nullptr, detectRootOnThread, nullptr);}  
+```
+
+**Java 层查询接口（JNI）**：
+```cpp  
+// native: dpt_risk.cpp  
+bool isRootDetected();  
+  
+// JNI: dpt.cpp 注册  
+// "isRootDetected", "()Z"  
+```
+
+**Java 层弹窗入口**（推荐放在 `ProxyComponentFactory`，因为能拿到稳定的 Activity WindowToken）：
+- `instantiateApplication()` 启动主线程 watcher（短轮询），等待 `JniBridge.isRootDetected()` 变为 true
+- `instantiateActivity()` 记录最近的 Activity，并在 Activity 可用时展示弹窗
+- 重点：避免在过渡 Activity（例如 `PandoraEntry`）上直接 `show()`，否则可能 `WindowLeaked` 导致用户看不到弹窗
+
+#### 4.3.5 命令行参数控制
+
+**参数说明**：
+- `--enable-root-detect`：启用 ROOT 检测加固功能（**默认关闭**）
+- `--disable-root-detect`：强制禁用 ROOT 检测加固功能（即使已启用）
+
+**使用示例**：
+```bash  
+# 启用 ROOT 检测  
+java -jar dpt.jar -f input.apk -o out/ --enable-root-detect  
+  
+# 禁用 ROOT 检测（默认行为，可省略）  
+java -jar dpt.jar -f input.apk -o out/  
+  
+# 强制禁用 ROOT 检测（即使之前启用过）  
+java -jar dpt.jar -f input.apk -o out/ --disable-root-detect  
+```
+
+**配置传递机制**：
+1. **编译时**：`dpt.jar` 将 `root_detect` 配置写入加密的 JSON 配置文件 `d_shell_data_001`，存储在 APK 的 `assets` 目录
+2. **运行时**：shell 在 `JNI_OnLoad()` 中读取并解密配置文件，解析 JSON 获取 `root_detect` 字段
+3. **执行控制**：根据 `root_detect` 配置值决定是否执行 `detectRoot()`
+
+**配置写入位置**：
+```java  
+// dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java  
+public void writeConfig(String packageDir, byte[] key) {  
+    // ...    JSONObject jsonObject = new JSONObject(baseJson);    jsonObject.put("root_detect", isRootDetect());  // 写入 root_detect 配置  
+    String json = jsonObject.toString();    // AES 加密后写入 assets/d_shell_data_001}  
+```
+
+**配置读取位置**：
+```cpp  
+// shell/src/main/cpp/dpt.cpp::read_shell_config()  
+void read_shell_config(JNIEnv *env) {  
+    // 从 APK 读取并解密配置文件  
+    // 解析 JSON，读取 root_detect 字段  
+    g_shell_config.root_detect = shell_config.value("root_detect", false);}  
+```
+
+#### 4.3.6 集成位置
+
+**集成到 `createAntiRiskProcess()`**（**条件执行**）：
+```cpp  
+// dpt.cpp::createAntiRiskProcess()  
+DPT_ENCRYPT void createAntiRiskProcess() {  
+    // 根据配置决定是否检测 ROOT（其他反调试功能始终启用）  
+    if (g_shell_config.root_detect) {        // ROOT 检测已启用，首先检测 ROOT（在主进程和子进程都要检测）  
+        detectRoot();    } else {        // ROOT 检测已禁用，跳过 ROOT 检测（不影响其他反调试功能）  
+    }    // fork 子进程（无论 ROOT 检测是否启用，都要执行反调试功能）  
+    pid_t child = fork();    if(child < 0) {        // fork 失败，只检测 Frida（和 ROOT，如果启用）  
+        detectFrida();        if (g_shell_config.root_detect) {            detectRoot();        }    }    else if(child == 0) {        // 子进程：检测 ptrace（和 ROOT，如果启用）  
+        // 注意：子进程中不调用 detectFrida()，避免创建线程导致问题  
+        if (g_shell_config.root_detect) {            detectRoot();        }        doPtrace();  // ptrace 反调试始终执行  
+    }    else {        // 主进程：监控子进程 + 检测 Frida（和 ROOT，如果启用）  
+        protectChildProcess(child);  // 子进程监控始终执行  
+        detectFrida();  // Frida 检测始终执行  
+        if (g_shell_config.root_detect) {            detectRoot();        }    }}  
+```
+
+**重要说明**：
+- ✅ **ROOT 检测可根据命令行参数控制**：默认关闭，使用 `--enable-root-detect` 启用
+- ✅ **其他反调试功能不受影响**：Frida 检测、ptrace 反调试、子进程监控等功能始终执行
+- ✅ **配置通过加密 JSON 传递**：编译时写入，运行时读取，确保安全性
+
+#### 4.3.7 执行流程
+
+```  
+应用启动  
+    ↓ProxyApplication.attachBaseContext()  
+    ↓加载 shell SO（System.load）  
+    ↓JNI_OnLoad()（SO 加载时）  
+    ├─→ read_shell_config() 读取加密配置文件  
+    │   ├─→ 从 APK assets/d_shell_data_001 读取  
+    │   ├─→ AES 解密  
+    │   ├─→ 解析 JSON，读取 root_detect 字段  
+    │   └─→ 设置 g_shell_config.root_detect    │    └─→ 延迟启动 createAntiRiskProcess()（延迟 500ms，确保 ART 虚拟机稳定）  
+        └─→ createAntiRiskProcess()            ├─→ 根据 g_shell_config.root_detect 决定是否执行 detectRoot()            │   └─→ 如果 root_detect = true：  
+            │       └─→ detectRoot()（立即检测一次）  
+            │           ├─→ isRooted() 综合检测（10 种已启用的检测方式）  
+            │           │   ├─→ 方式 1：检测 su 文件路径（15 个路径）✅  
+            │           │   ├─→ 方式 2：检测 Magisk 文件（7 个路径）✅  
+            │           │   ├─→ 方式 3：检测系统属性（ro.build.tags, ro.secure）✅  
+            │           │   ├─→ 方式 4：检测 root 管理应用（包括 KernelSU 应用）✅  
+            │           │   ├─→ 方式 5：检测 PATH 中的 su ✅  
+            │           │   ├─→ 方式 6：检测 SELinux 状态 ✅  
+            │           │   ├─→ 方式 7：检测 KernelSU 文件路径（7 个路径）✅  
+            │           │   ├─→ 方式 8：检测进程 UID（/proc/self/status）✅  
+            │           │   ├─→ 方式 9：检测系统分区挂载状态 ❌ 已禁用  
+            │           │   ├─→ 方式 10：检测内核符号表 ❌ 已禁用  
+            │           │   ├─→ 方式 11：检测内核模块（/proc/modules）✅  
+            │           │   ├─→ 方式 12：检测 SELinux 状态文件（/sys/fs/selinux/status）✅  
+            │           │   └─→ 方式 13：尝试执行 su 命令 ❌ 已禁用  
+            │           │            │           └─→ 如果检测到 ROOT：  
+            │               ├─→ 设置 g_root_detected=true（供 Java 层查询）  
+            │               ├─→ 启动延迟退出线程（默认 10s 后调用 dpt_crash()）  
+            │               └─→ Java 层 watcher 在稳定 Activity 上弹出告警弹窗  
+            │           │            │           └─→ 启动 detectRootOnThread() 后台线程  
+            │               └─→ 每 10 秒检测一次  
+            │                   └─→ 如果检测到 ROOT：同上（置位 + 延迟退出）  
+            │            ├─→ fork() 子进程（无论 ROOT 检测是否启用，都要执行）  
+            │            ├─→ 主进程分支：  
+            │   ├─→ protectChildProcess()（子进程监控，始终执行）  
+            │   ├─→ detectFrida()（Frida 检测，始终执行）  
+            │   └─→ detectRoot()（如果 root_detect = true）  
+            │            └─→ 子进程分支：  
+                ├─→ detectRoot()（如果 root_detect = true）  
+                └─→ doPtrace()（ptrace 反调试，始终执行）  
+```
+
+**关键点说明**：
+1. **配置读取时机**：在 `JNI_OnLoad()` 中读取，确保在反调试逻辑执行前完成
+2. **延迟启动**：`createAntiRiskProcess()` 在延迟线程中执行（延迟 500ms），避免在 `JNI_OnLoad()` 中直接 `fork()` 导致崩溃
+3. **条件执行**：ROOT 检测根据 `root_detect` 配置值决定是否执行，其他反调试功能始终执行
+4. **不影响其他功能**：Frida 检测、ptrace 反调试、子进程监控等功能不受 ROOT 检测开关影响
+
+#### 4.3.8 字符串混淆
+
+**使用 AY_OBFUSCATE 宏**：  
+所有检测路径都应该使用 `AY_OBFUSCATE()` 宏进行字符串混淆，防止静态分析：
+
+```cpp  
+const char *su_path = AY_OBFUSCATE("/system/bin/su");  
+const char *magisk_path = AY_OBFUSCATE("/sbin/magisk");  
+const char *prop_name = AY_OBFUSCATE("ro.build.tags");  
+```
+
+#### 4.3.9 KernelSU 检测说明
+
+**KernelSU 的特殊性**：
+- KernelSU 是**内核级 ROOT 方案**，通过修改内核实现 ROOT 权限
+- 相比传统的用户空间 ROOT 方案（如 SuperSU、Magisk），KernelSU 更难检测
+- KernelSU 可能不会在常见路径留下 su 文件，也不会修改系统属性
+- 因此需要采用**更深层次的检测方式**（方式 7-13）
+
+**针对 KernelSU 的检测策略**（当前实现状态）：
+1. **文件路径检测**（方式 7）✅：检测 KernelSU 特有的文件路径（7 个路径）
+2. **进程 UID 检测**（方式 8）✅：KernelSU 可能通过内核修改进程 UID
+3. **挂载点检测**（方式 9）❌：检测系统分区是否被重新挂载为可读写（**已禁用，容易误报**）
+4. **内核符号表检测**（方式 10）❌：检测是否能读取有效的内核符号（**已禁用，容易误报**）
+5. **内核模块检测**（方式 11）✅：检测是否有 KernelSU 相关的内核模块（**已优化**）
+6. **SELinux 状态检测**（方式 12）✅：检测 SELinux 是否被禁用
+7. **su 命令检测**（方式 13）❌：尝试执行 su 命令验证是否有 ROOT 权限（**已禁用，可能阻塞**）
+
+**检测效果**：
+- 通过综合使用当前已启用的 10 种检测方式，可以有效检测到 KernelSU
+- 即使 KernelSU 隐藏了部分痕迹，其他检测方式仍可能发现 ROOT 状态
+- 已禁用的检测方式（方式 9、10、13）虽然可能提高检测率，但容易误报，因此已禁用
+- 建议定期更新检测方式，以应对 KernelSU 的更新
+
+#### 4.3.10 误报风险与已禁用检测方式说明
+
+**可能导致误报的检测方式（已禁用）**：
+
+1. **方式 9：检测系统分区挂载状态（/proc/mounts）** ❌ **已禁用**
+    - **误报原因**：
+        - 某些正常设备上，系统分区可能被挂载为 `rw`（可读写），这不一定是 ROOT 的标志
+        - 某些厂商 ROM 或开发版本可能允许系统分区可写
+        - 检测逻辑过于严格，容易误判正常设备为 ROOT
+    - **禁用状态**：代码中已注释，不会执行此检测
+    - **影响**：可能无法检测到通过重新挂载系统分区实现的 ROOT，但避免了误报
+
+2. **方式 10：检测内核符号表（/proc/kallsyms）** ❌ **已禁用**
+    - **误报原因**：
+        - 某些设备即使没有 ROOT，也可能允许读取 `/proc/kallsyms`
+        - 虽然内容可能是全 0，但检测逻辑可能不够严格，导致误报
+        - 不同设备的内核符号表格式可能不同，检测逻辑难以适配所有设备
+    - **禁用状态**：代码中已注释，不会执行此检测
+    - **影响**：可能无法检测到通过内核符号表暴露的 ROOT，但避免了误报
+
+3. **方式 13：尝试执行 su 命令** ❌ **已禁用**
+    - **误报/阻塞原因**：
+        - `timeout` 命令在某些 Android 设备上可能不存在，导致命令执行失败
+        - 即使使用 `timeout`，在某些设备上仍可能阻塞
+        - 如果设备有 su 但需要用户确认，可能导致应用启动时阻塞
+    - **禁用状态**：代码中已注释，不会执行此检测
+    - **影响**：可能无法检测到通过 su 命令实现的 ROOT，但避免了阻塞和兼容性问题
+
+**已优化检测方式**：
+
+1. **方式 11：检测内核模块（/proc/modules）** ✅ **已优化**
+    - **优化内容**：
+        - 更精确地匹配 "kernelsu" 模块名
+        - 检查独立的 "ksu" 模块时，确保它是模块名的一部分，而不是其他字符串的一部分
+        - 避免误报（如其他模块名包含 "ksu" 字符串）
+    - **状态**：已启用，检测逻辑已优化
+
+#### 4.3.10 注意事项
+
+1. **误报风险**：
+    - `ro.debuggable=1` 不一定表示 ROOT（可能是开发版本）
+    - `ro.build.tags=test-keys` 可能是官方测试版本
+    - 已禁用的检测方式（方式 9、10、13）容易误报，因此已禁用
+    - 建议综合多种检测方式（当前 10 种已启用），避免单一检测的误报
+
+2. **绕过可能**：
+    - Magisk Hide 可能会隐藏 ROOT 痕迹
+    - KernelSU 作为内核级 ROOT 方案，可能更难检测
+    - 某些高级 ROOT 工具可能会 Hook 系统调用
+    - 建议结合多种检测方式（当前 10 种已启用），提高检测准确性
+    - 建议结合其他检测方式（如 Frida 检测）
+
+3. **性能影响**：
+    - 文件系统检测（access）性能开销很小
+    - 系统属性检测性能开销很小
+    - `/proc` 目录访问性能开销很小
+    - 后台线程每 10 秒检测一次，对性能影响很小
+
+4. **兼容性**：
+    - `popen()` 在某些 Android 版本可能不可用，已添加错误处理
+    - `/proc` 目录访问需要权限，可能在某些设备上失败，已添加错误处理
+    - 所有文件操作都有错误检查，避免检测失败导致应用崩溃
+
+5. **检测时机**：
+    - 应用启动时立即检测一次
+    - 后台线程持续检测（每 10 秒）
+    - 主进程和子进程都要检测，提高可靠性
+
+6. **日志输出**：
+    - 使用 `DLOGD()` 输出调试日志
+    - 检测到 ROOT 时输出警告日志（`DLOGW()`）
+    - 避免输出敏感信息（如检测路径，已使用字符串混淆）
+    - **重要**：release 构建下 `DLOG*` 可能会被编译为空（取决于编译宏），排查 Java 弹窗链路建议使用 `[ROOT_WARNING]` 前缀日志
+
+7. **检测方式启用/禁用**：
+    - 当前共实现 13 种检测方式，其中 10 种已启用，3 种已禁用
+    - 已禁用的检测方式在代码中已注释，不会执行
+    - 如需启用已禁用的检测方式，需要在实际设备上充分测试，避免误报
+
+#### 4.3.11 头文件依赖
+
+**需要在 `dpt_risk.h` 中添加**：
+```cpp  
+#include <sys/system_properties.h>  // 系统属性检测  
+#include <fcntl.h>                  // access() 函数  
+#include <stdio.h>                   // popen(), fgets()  
+#include <dirent.h>                  // /proc 目录遍历  
+```
+
+#### 4.3.12 测试建议
+
+1. **正常设备测试**：
+    - 在未 ROOT 的设备上运行，应用应正常启动
+    - 检查 logcat，确认没有误报
+
+2. **ROOT 设备测试**：
+    - 在已 ROOT 的设备上运行：
+        - 应在稳定界面出现后弹出 **安全告警弹窗**
+        - 默认在 **约 10 秒后自动退出**
+        - 点击弹窗“确定”后应 **立即退出**
+    - 测试不同的 ROOT 工具（SuperSU、Magisk、KingRoot、KernelSU 等）
+    - **重点测试 KernelSU**：KernelSU 是内核级 ROOT 方案，需要验证当前已启用的 10 种检测方式是否有效
+    - 测试已禁用的检测方式（方式 9、10、13）在实际设备上的表现，评估是否可以重新启用
+
+3. **误报测试**：
+    - 在正常设备上运行，应用应正常启动
+    - 测试不同厂商的 ROM（MIUI、ColorOS、OneUI 等）
+    - 测试开发版本和测试版本，确认不会误报
+    - 如果发现误报，需要进一步优化检测逻辑或禁用相关检测方式
+
+4. **绕过测试**：
+    - 测试 Magisk Hide 是否能绕过检测
+    - 测试删除 su 文件后是否能绕过检测
+
+5. **性能测试**：
+    - 监控检测线程的 CPU 占用
+    - 确认检测不影响应用正常使用
+
+#### 4.3.13 参考资源
+
+- **RootBeer**：https://github.com/scottyab/rootbeer
+- **Android 系统属性**：https://source.android.com/devices/tech/config
+- **Magisk 文档**：https://topjohnwu.github.io/Magisk/
+- **KernelSU 文档**：https://kernelsu.org/
+- **KernelSU GitHub**：https://github.com/tiann/KernelSU
+- **SELinux 文档**：https://source.android.com/security/selinux
+- **Android Root 检测最佳实践**：https://github.com/scottyab/rootbeer/blob/master/README.md
+
+### 4.4 模拟器检测
+
+目标：新增模拟器检测能力，且尽量 **不影响 ROOT / Proxy / Hook** 现有检测链路，并降低模块耦合。
+
+> 说明：IMEI/手机号/传感器等信号在平板、无基带设备、企业定制机上误报概率较高，建议仅作为“弱信号加分项”，不要单点判定。
+
+#### 4.4.1 设计原则（降低耦合）
+1. **Native 判定、Java 展示**：Native 层负责采集信号、判定、置位（如 `g_emulator_detected`）；Java 层只负责查询状态并在合适时机弹窗/退出。
+2. **每个风险点独立状态位**：ROOT/Proxy/Emulator/Hook 各自维护 `isXxxDetected()`，避免互相依赖内部细节。
+3. **统一的“风险提示协调器（Watcher）”**：沿用现有“Activity resumed 后弹窗”的模式，在 Java 层只做 **优先级裁决**（例如 ROOT > Proxy > Emulator > Hook），避免每个功能各写一套 UI/退出逻辑。
+
+#### 4.4.2 配置开关（建议）
+在 `shell_config.json` 中新增：
+- `emulator_detect`：bool，是否启用模拟器检测
+- （可选）`emulator_detect_mode`：0/1/2（off / warn / block），用于灰度与降低误杀
+- （可选）`emulator_detect_score_threshold`：int，评分阈值（默认建议 100）
+- （可选）`emulator_detect_allowlist`：string[]，用于内部测试放行（建议仅内部渠道启用）
+
+#### 4.4.3 检测信号分层（建议“多信号评分”，避免误杀）
+**强信号（命中 1 个即可高度可疑）**：
+- 系统属性：`ro.kernel.qemu=1`、`ro.boot.qemu=1`
+- 设备节点：`/dev/qemu_pipe`、`/dev/qemu_trace`、`/dev/socket/qemud`
+- 硬件特征：`Build.HARDWARE` 命中 `goldfish` / `ranchu` / `vbox86`
+
+**中信号（需要组合命中，避免误报）**：
+- `Build.FINGERPRINT` / `MODEL` / `PRODUCT` / `DEVICE` / `BRAND` 命中 `generic` / `sdk_gphone` / `Android SDK built for x86` / `Emulator` / `Genymotion`
+- `/proc/cpuinfo` 命中 `Goldfish` / `ranchu` / `Android Emulator`
+
+**弱信号（只加分，不单点判定）**：
+- 网络/传感器/基带等信息异常（容易误报，建议仅作为弱信号）
+
+#### 4.4.3.1 推荐评分模型（便于灰度与降低误杀）
+建议将“命中”转为评分累加，最终以阈值判定：
+
+- **强信号（+100，单点即可达到默认阈值）**
+  - `ro.kernel.qemu == 1` 或 `ro.boot.qemu == 1`
+  - 命中任意 QEMU 设备节点（`/dev/qemu_pipe`、`/dev/qemu_trace`、`/dev/socket/qemud`）
+  - `Build.HARDWARE` 命中 `goldfish/ranchu/vbox86`
+- **中信号（+30 ~ +60，需要组合）**
+  - `Build.FINGERPRINT/MODEL/PRODUCT/DEVICE/BRAND` 命中常见 emulator 字段（`generic`、`sdk_gphone`、`Android SDK built for x86`、`Emulator`、`Genymotion`）
+  - `/proc/cpuinfo` 命中 `Goldfish/ranchu/Android Emulator`
+  - ABI/CPU 线索（如 x86/x86_64）可作为中信号，但注意少量真机/特殊设备也可能命中
+- **弱信号（+5 ~ +20，只加分）**
+  - Telephony/基带/传感器异常、固定 IP 习惯值等（建议只做弱信号，避免平板/车机误报）
+
+> 实践建议：首次引入建议默认 **warn** 先灰度收集（日志/上报），确认误报率可控后再切 **block**。
+
+#### 4.4.4 推荐落地路径（与现有架构对齐）
+1. **Native 层新增 `detectEmulator()`**：放在 `dpt_risk.cpp`，实现系统属性 + 文件节点 + cpuinfo 等检测，返回 bool。
+2. **`createAntiRiskProcess()` 集成**：在 `dpt.cpp` 中按配置开关调用（与 `root_detect / proxy_detect / xposed_detect / hook_detect` 同级），尽量不阻塞主线程。
+3. **对外暴露 `isEmulatorDetected()`**：通过 JNI 或统一风险查询接口供 Java 侧 watcher 使用。
+4. **UI/退出**：复用 ROOT/Proxy 的“弹窗 + 延迟退出”机制；若担心误杀，优先按 `emulator_detect_mode` 做 warn/block 分级。
+
+#### 4.4.4.1 建议的职责拆分（降低耦合、便于长期维护）
+- **Native（dpt_risk.cpp）只做**：
+  - 信号采集（property / 文件节点 / proc 文件）
+  - 评分与最终判定（置位 `g_emulator_detected`）
+  - 提供 `isEmulatorDetected()` 查询（给 Java watcher 用）
+- **Java 侧只做**：
+  - 在 Activity 稳定后展示 UI（弹窗）
+  - 与 ROOT/Proxy/Hook 做“统一优先级裁决”，避免多个模块互相调用
+
+#### 4.4.4.2 引入建议（尽量不影响其他检测功能）
+1. **可选开关 + 分级模式**：默认关闭或 warn；不要首次引入就 block，先跑一轮真实设备数据。
+2. **避免阻塞启动**：不要在主线程做 `/proc` 读取/文件遍历；与现有延迟线程/子进程模型保持一致。
+3. **避免与壳填回耦合**：模拟器检测不依赖 dexMap，不触碰 `dpt_hook.cpp` 的壳填回逻辑；只做独立状态位 + watcher 协调即可。
+4. **白名单仅用于内部渠道**：通过“内部签名/渠道”控制 allowlist 是否生效，避免被滥用绕过。
+
+#### 4.4.5 与其他检测的冲突与优先级（建议）
+建议 UI 提示优先级：**ROOT > Proxy > Emulator > Hook**。  
+原因：ROOT/Proxy 通常是“用户可理解的环境风险”，而 Hook 检测更容易出现兼容性/误报，需要更谨慎地处理。
+
+**参考资料**：
+- [Fuzion24/AndroidEmulatorDetection](https://github.com/Fuzion24/AndroidEmulatorDetection)
+- [Google AOSP: System Properties](https://source.android.com/devices/tech/config)
+- [Android `Build` / `Build.VERSION` 参考](https://developer.android.com/reference/android/os/Build)
+- [Android Emulator 官方文档](https://developer.android.com/studio/run/emulator)
+
+### 4.6 字符串加密（DEX 中）
+
+**实现思路**：
+1. 编译时：使用 ASM 或 Javassist 修改 DEX，加密字符串常量
+2. 运行时：Hook `String` 类的初始化，解密字符串
+
+**实现方案**：
+
+- 使用 ASM 在编译时修改字节码
+- 将所有字符串替换为加密后的字节数组
+- 运行时通过 JNI 解密
+
+**参考资料**：
+- ASM 框架：https://asm.ow2.io/
+- 字符串加密示例：https://github.com/obfuscator-llvm/obfuscator
+
+### 4.7 资源文件加密
+
+本节给出一套**可直接落地**且与当前 dpt-shell 架构低耦合的“资源文件加密（v1）”方案：**只加密 `assets/`**，运行期在壳启动早期解密并通过 `AssetManager.addAssetPath()` 挂载 overlay，使业务侧读取仍保持 **transparent**。
+
+> 说明：`res/`（含 `resources.arsc`）要做到透明加密通常需要深度 Hook framework/native，适配成本与稳定性风险很高；v1 不建议直接做。
+
+#### 4.7.1 设计原则（避免与壳核心能力冲突）
+- **时序隔离**：资源解密/挂载发生在 “shell SO 已可用 + shell config 已解密” 之后，且在 “真实 `Application` 创建/Provider 创建” 之前（尽量 early）。
+- **不影响代码分离/指令混淆/SO 加密**：资源加密只处理 `assets/` 静态文件，不触碰 dex/so 相关产物路径与加载顺序。
+- **低耦合开关**：通过 shell config（加密 JSON）传递开关与 key，Java 侧只负责挂载，native 侧负责解密产物读取（与 root/proxy/hook/emulator 类似分工）。
+
+#### 4.7.2 CLI 参数设计（dpt）
+新增参数（建议）：
+- `--enable-assets-encrypt`：启用 assets 加密（默认关闭）
+- `--assets-encrypt-dir <dir>`：指定要加密的目录（可多次传入）
+  - 支持 `html` / `assets/html` 两种写法，内部 normalize 为 `assets/html/`
+  - 若未指定 `--assets-encrypt-dir`，则默认对 `assets/` 做“全量尝试加密”（但会应用强制 exclude，见下文）
+- `--assets-encrypt-exclude <glob>`：排除规则（可多次传入）
+- （可选）`--assets-encrypt-min-size <bytes>`：小文件不加密，减少启动期开销
+
+#### 4.7.3 强制排除列表（必须有，否则壳会直接启动失败）
+即使用户选择“全量加密 `assets/`”，也必须默认排除：
+- `assets/d_shell_data_001`：shell config（native 读取位置：`assets/d_shell_data_001`，见 `SHELL_CONFIG_IN_ZIP`）
+- `assets/OoooooOooo`：CodeItem 文件（运行期 `init_app()` 必需，见 `CODE_ITEM_NAME_IN_ZIP` / `Const.KEY_CODE_ITEM_STORE_NAME`）
+- `assets/i11111i111.zip`：DEX 压缩包（运行期解壳流程必需，见 `DEXES_ZIP_NAME` / `Const.KEY_DEXES_STORE_NAME`）
+- `assets/i11111i111_unaligned.zip`：DEX 中间产物（兼容/中间过程可能出现，建议一并排除）
+- `assets/vwwwwwvwww/**`：壳 SO 所在 assets 目录（`Global.ZIP_LIB_DIR = "vwwwwwvwww"`，Java 解压/加载依赖）
+- `assets/.dpt/**`：资源加密产物目录（避免自我加密递归）
+
+#### 4.7.4 打包期产物形态（推荐：pack-then-encrypt）
+为降低实现复杂度与运行时 Hook 风险，v1 推荐将目标 assets **先打包**再加密：
+
+- **明文 pack（中间产物）**：`assets_plain.zip`
+  - zip 内保留原始路径结构：`assets/<original_path>`
+- **最终加密产物（写入 APK assets）**：`assets/.dpt/enc/assets.pack`
+
+`assets.pack` 建议格式（自描述 header，便于版本演进）：
+
+```text
+magic(8) = "DPTASET1"
+version(u32) = 1
+iv_len(u32) = 16
+iv(bytes[16])
+cipher_len(u32)
+cipher(bytes[cipher_len])   // AES-CBC(PKCS5Padding) 加密后的 assets_plain.zip
+```
+
+> crypto 建议：v1 直接复用 dpt 侧已有 `AES/CBC/PKCS5Padding`（`CryptoUtils.aesEncrypt`）与 shell 侧已有 `aes_cbc_decrypt`，减少引入新算法导致的兼容风险。
+
+#### 4.7.5 dpt 打包期流程（实现步骤）
+1. **收集目标文件**：遍历 APK 的 `assets/`，按以下规则得到加密列表：
+   - 如果传入 `--assets-encrypt-dir`：只加密指定目录下文件
+   - 否则：默认尝试加密 `assets/` 全量
+   - 始终应用 “强制排除列表” + `--assets-encrypt-exclude`
+2. **打包**：把“待加密文件集合”写入 `assets_plain.zip`
+3. **生成 key**：生成每包随机 `assets_key`（建议 16 bytes），写入 shell config（加密 JSON）：
+   - `assets_encrypt: true/false`
+   - `assets_key: <base64或hex>`
+   - `assets_pack_path: "assets/.dpt/enc/assets.pack"`（可选，固定值也可不写）
+4. **加密**：`AES-CBC(PKCS5Padding)` 加密 `assets_plain.zip` → `assets.pack`
+5. **清理明文**：从 APK 的 `assets/` 中删除“已加密集合内”的原始明文文件（排除列表中的文件绝不能删除/改动）
+
+#### 4.7.6 shell 运行期流程（启动早期解密 + overlay 挂载）
+**目标**：业务侧依旧通过 `AssetManager.open()` / `context.getAssets().open()` 读取到明文，但 APK 内不保留明文 assets。
+
+推荐时序（尽量 early，且避免类名/解壳冲突）：
+- 在 `AppComponentFactory` 的 `instantiate*` 链路中增加一次 `AssetsEncryptFeature.ensureMounted()`（只执行一次）：
+  - `instantiateApplication()`（保证 Application 可读）
+  - `instantiateProvider()`（可选但推荐：保证 Provider 也可读）
+
+运行步骤：
+1. **native 读取 config**：确认 `assets_encrypt == true`，拿到 `assets_key`
+2. **从 APK zip 读取 pack**：读取 `assets/.dpt/enc/assets.pack`
+3. **解密输出 overlay**：解密得到 `assets_plain.zip`，写入到 app 私有目录（建议复用当前 cache 路径体系）：
+   - `dataDir/code_cache/dpt_assets_overlay.apk`
+   - 说明：虽然内容是 zip，但使用 `.apk` 扩展名能提升部分 ROM/版本上 `AssetManager.addAssetPath()` 的成功率（更符合系统对“资源路径”的预期）。
+4. **缓存复用**：若 overlay 已存在且校验通过（size/hash/pack 的 CRC 等），则跳过重复解密
+5. **Java 挂载**：反射调用 `AssetManager.addAssetPath(overlayZipPath)` 将 overlay zip 挂载进当前进程的 `AssetManager`
+
+失败策略（建议）：
+- 默认：解密/挂载失败只打日志并继续启动（避免误伤导致“不开启也打不开”）
+- 可选严格模式：`assets_encrypt_strict`，失败直接 `dpt_crash()`（生产安全场景可用）
+
+#### 4.7.7 目录指定与默认行为（你关心的场景）
+- **用户指定目录**：例如 `--assets-encrypt-dir assets/html`，则只加密 `assets/html/**`
+- **用户未指定目录但启用**：默认尝试加密全 `assets/**`，但会自动排除：
+  - `assets/d_shell_data_001`
+  - `assets/vwwwwwvwww/**`
+  - `assets/.dpt/**`
+  - 以及用户通过 `--assets-encrypt-exclude` 指定的额外排除项
+
+#### 4.7.8 后续扩展路线（v2 提示）
+- `res/raw`：若必须支持，优先考虑“将敏感 raw 迁移到 assets”以降低风险。
+- `res/` 全量（含 `resources.arsc`）：通常需要 framework/native 层 Hook（`openNonAsset` 等路径），ROM/SDK 适配成本高，建议作为高级模式，默认关闭并做白名单。
+
+#### 4.7.9 Checklist（落地与回归）
+- **打包期（dpt）**
+  - **开关与目录**：`--enable-assets-encrypt` 生效；`--assets-encrypt-dir assets/html` 只加密该目录；不传 dir 时默认尝试全 `assets/**`。
+  - **强制排除**：确认以下路径从不被加密/删除：
+    - `assets/d_shell_data_001`
+    - `assets/vwwwwwvwww/**`
+    - `assets/.dpt/**`
+  - **产物存在**：输出 APK/AAB 内存在 `assets/.dpt/enc/assets.pack`，且 size > 0。
+  - **明文移除**：被加密集合内的原始 `assets/<path>` 不应再以明文存在（避免“加密了但仍泄漏明文”）。
+  - **日志可定位**：打包日志输出被加密文件数量、被排除数量、pack 大小、是否启用 `min-size`。
+
+- **运行期（shell）**
+  - **时序**：在真实 `Application` 创建前完成 overlay 准备与挂载（至少在 `instantiateApplication()` 返回前）。
+    - 实战建议：同时在 `instantiateClassLoader()` / `instantiateProvider()` / `instantiateApplication()` 都尝试挂载一次（只允许成功一次），避免第三方 SDK/Provider 在非常早期读取 assets 导致读不到明文而卡住。
+  - **缓存复用**：二次启动不应重复解密（overlay zip 已存在且校验通过时复用）。
+  - **失败策略**：解密/挂载失败默认只记录日志并继续启动（避免误伤导致“启用后 app 直接打不开”）；如有严格模式再 crash。
+  - **可观测性**：logcat 中能看到：
+    - `assets_encrypt` 是否开启
+    - overlay 输出路径
+    - `addAssetPath` 是否成功（返回 cookie>0 / 异常堆栈）
+    - 若业务卡启动页，优先关注是否出现业务侧 `PlatformUtil.getResInputStream FileNotFoundException`（典型是 `data/dcloud_control.xml`、`uni-jsframework.js` 等），这通常表示 overlay 未生效或挂载太晚。
+
+- **功能回归**
+  - **壳核心能力不受影响**：代码分离/指令混淆/SO 加密解密流程不变；不出现 “找不到类名 / JNI 绑定失败”。
+  - **SO 加载正常**：`assets/vwwwwwvwww/**` 必须保持原逻辑可解压/加载。
+  - **config 读取正常**：`assets/d_shell_data_001` 必须保持原逻辑可读取。
+  - **其他检测不冲突**：root/proxy/hook/emulator 的弹窗/退出行为不受影响。
+
+- **用例建议**
+  - **指定目录加密**：`--assets-encrypt-dir assets/html`，运行期 `getAssets().open("html/index.html")` 能读到明文。
+  - **全量加密 + 排除**：不传 dir，确认排除项仍可用，且业务 assets 读取正常。
+  - **大资源压力**：assets 总量较大时测启动耗时（必要时启用 `--assets-encrypt-min-size` 或改为分目录加密）。
+
+**参考资料**：
+- [Android 资源（Resources）概览](https://developer.android.com/guide/topics/resources/providing-resources)
+- [AssetManager API](https://developer.android.com/reference/android/content/res/AssetManager)
+- [Resources.openRawResource API](https://developer.android.com/reference/android/content/res/Resources#openRawResource(int))
+- `AOSP AssetManager.java`（查 `addAssetPath` 行为）：`https://android.googlesource.com/platform/frameworks/base/+/master/core/java/android/content/res/AssetManager.java`
+
+### 4.8 VMP 虚拟化保护
+
+**实现思路**：
+1. 将 DEX 指令转换为自定义虚拟指令
+2. 实现虚拟解释器执行虚拟指令
+3. 虚拟指令与真实指令一一对应
+
+**实现方案**：
+- 使用 LLVM Obfuscator 或自定义编译器
+- 将 Dalvik 指令映射到虚拟指令集
+- 实现虚拟解释器（类似 JVM）
+
+**参考资料**：
+- LLVM Obfuscator：https://github.com/obfuscator-llvm/obfuscator
+- VMP 原理：https://bbs.pediy.com/thread-216095.htm
+
+### 4.9 Java2CPP 转换
+
+**实现思路**：
+1. 使用 J2C 工具将 Java 代码转换为 C++
+2. 编译为 SO 文件
+3. 通过 JNI 调用
+
+**实现方案**：
+- 使用 JNI 生成工具（如 SWIG）
+- 或使用自定义编译器
+
+**参考资料**：
+- JNI 开发指南：https://docs.oracle.com/javase/8/docs/technotes/guides/jni/
+
+### 4.10 防内存 DUMP
+
+**实现思路**：
+1. Hook `memcpy`, `fwrite` 等内存操作函数
+2. 检测内存读取操作
+3. 混淆内存布局
+
+**实现代码示例**：
+```cpp  
+void* fake_memcpy(void* dest, const void* src, size_t n) {  
+    // 检测是否在读取 DEX 内存  
+    if(isDexMemory(src)) {        // 返回假数据或崩溃  
+        dpt_crash();    }    return BYTEHOOK_CALL_PREV(fake_memcpy, dest, src, n);}  
+```
+
+### 4.11 APK 签名校验
+
+本节记录当前 dpt-shell 已落地的 **APK 签名校验** 方案：用于识别 **re-sign/repack（二次打包/重签名）**。  
+目标是“低耦合接入、不影响现有检测链路”，并且与现有 ROOT/Proxy/Emulator 的“**native 判定/置位 + Java 展示/协调**”模式一致。
+
+#### 4.11.1 设计目标与策略
+- **检测目标**：识别“加固产物被重签名/替换签名证书”的场景（典型攻击链：repack → re-sign）。
+- **处置策略**：支持 `warn`（默认，仅提示）和 `block`（强阻断，弹窗退出）两种模式。
+- **配置安全（v2-2）**：引入 HMAC-SHA256 完整性校验，防止攻击者通过修改配置关闭校验或降级策略。
+- **低耦合原则**：
+  - **dpt 打包期注入 allowlist**，shell 运行期只读配置并校验，不依赖业务代码。
+  - **native 只做匹配与置位**，Java 只做“取 signer/调 JNI/展示提示”。
+
+#### 4.11.2 命令行参数控制
+- `--apk-sig-policy <warn|block>`：设置签名校验策略（默认 `warn`）。
+
+#### 4.11.3 配置注入（dpt → shell_config）
+在 `dpt` 打包期写入 `assets/d_shell_data_001`：
+- `apk_sig_verify`：是否启用（默认跟随本次 dpt 是否签名）。
+- `apk_sig_policy`：处置模式（`warn`/`block`）。
+- `apk_sig_sha256`：预期签名的 SHA-256 指纹列表（DER 格式）。
+- `cfg_ver`：配置版本（当前为 `2`）。
+- `cfg_hmac_sha256`：配置完整性 HMAC。
+
+#### 4.11.4 配置完整性校验（v2-2）
+shell native 在解析配置后，会对关键字段（如 verify/policy/allowlist）复算 HMAC-SHA256：
+- **匹配**：日志输出 `[CFG_INTEGRITY] ok`。
+- **不匹配/缺失**：日志输出 `[CFG_INTEGRITY] mismatch`，并**强制将策略提升为 `block`**，防止降级攻击。
+
+#### 4.11.5 运行期校验流程（shell）
+1.  **早期触发**：在 `AppComponentFactory` 阶段尝试校验，由于时序问题若环境未就绪（pkg/basePkg 为空），会启动 **deferred(pkg_not_ready)** 重试机制。
+2.  **证书读取**：优先使用 API 28+ 的 `hasSigningCertificate`，兼容性回退使用 `getPackageInfo` 获取签名指纹。
+3.  **Native 对比**：将当前签名指纹传给 Native，与 `apk_sig_sha256` 列表比对。
+4.  **阻断行为（v2-1）**：若判定为 `tampered` 且策略为 `block`：
+    - **Java 侧**：在第一个稳定的 Activity 弹出安全警告并强制退出应用。
+    - **Native 侧**：启动一个后台线程，在一定时间（约 10s）后执行 `dpt_crash` 延迟崩溃兜底，防止 UI 拦截被 Hook。
+
+#### 4.11.6 可观测性关键日志
+- `[SIG_VERIFY] apk signature ok`：通过。
+- `[SIG_VERIFY] apk signature mismatch, policy=...`：异常。
+- `[CFG_INTEGRITY] mismatch`：配置被篡改。
+- `[SIG_VERIFY] checked via=... ok=...`：校验执行路径与最终结论。
+
+#### 4.11.7 测试方案
+1.  **正常安装测试**：确认日志出现 `ok` 且应用正常启动。
+2.  **重签名测试**：使用其他证书重签 APK，确认触发 `mismatch`（warn 模式弹 Toast，block 模式弹窗退出）。
+3.  **配置篡改测试**：手动改动 `d_shell_data_001` 中的 `apk_sig_verify` 为 `false` 后重签，确认触发 `[CFG_INTEGRITY] mismatch` 并被强制阻断。
+
+#### 4.11.8 后续增强建议（v2-3）
+- **Native 侧签名块解析**：脱离 `PackageManager`，在 native 侧直接解析 APK 文件的 v2/v3 签名块指纹，对抗针对系统 API 的全局 Hook 绕过。
+- **多证书白名单**：支持数组形式的 allowlist，适配多渠道、轮换证书场景。
+
+### 4.12 防截屏
+
+#### 4.12.1 实现思路
+
+防截屏功能通过设置 Android 的 `FLAG_SECURE` 窗口标志来防止用户截屏和录屏。该功能采用**统一的功能管理架构**，与其他功能模块解耦，便于扩展和维护。
+
+**核心机制**：
+- 使用 `WindowManager.LayoutParams.FLAG_SECURE` 标志
+- 采用**双重保险**策略：在 Activity 创建和恢复时都应用保护
+- 通过命令行参数控制，默认关闭，按需启用
+- 配置通过加密 JSON 传递，确保安全性
+
+#### 4.12.2 命令行参数控制
+
+**参数说明**：
+- `--enable-screenshot-protect`：启用防截屏加固功能（**默认关闭**）
+
+**使用示例**：
+```bash  
+# 启用防截屏功能  
+java -jar dpt.jar -f input.apk -o out/ --enable-screenshot-protect  
+  
+# 同时启用 ROOT 检测和防截屏  
+java -jar dpt.jar -f input.apk -o out/ --enable-root-detect --enable-screenshot-protect  
+```
+
+#### 4.12.3 配置传递机制
+
+**配置写入位置**：
+```java  
+// dpt/src/main/java/com/luoye/dpt/builder/AndroidPackage.java  
+public void writeConfig(String packageDir, byte[] key) {  
+    // ...    JSONObject jsonObject = new JSONObject(baseJson);    jsonObject.put("root_detect", isRootDetect());    jsonObject.put("screenshot_protect", isScreenshotProtect());  // 写入防截屏配置  
+    String json = jsonObject.toString();    // AES 加密后写入 assets/d_shell_data_001}  
+```
+
+**配置读取位置**：
+```cpp  
+// shell/src/main/cpp/dpt.cpp::read_shell_config()  
+void read_shell_config(JNIEnv *env) {  
+    // 从 APK 读取并解密配置文件  
+    // 解析 JSON，读取 screenshot_protect 字段  
+    g_shell_config.screenshot_protect = shell_config.value("screenshot_protect", false);}  
+```
+
+#### 4.12.4 功能管理架构
+
+**统一功能管理接口**：
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/feature/FeatureManager.java  
+public class FeatureManager {  
+    /**     * 初始化所有功能模块  
+     * 根据配置启用或禁用各个功能  
+     */    public static void initialize(boolean rootDetectEnabled, boolean screenshotProtectEnabled) {        // 初始化防截屏功能  
+        if (screenshotProtectEnabled) {            ScreenshotProtectFeature.enable();        } else {            ScreenshotProtectFeature.disable();        }    }  
+    /**     * 在 Activity 创建时应用所有需要的功能  
+     */    public static void onActivityCreated(Activity activity) {        ScreenshotProtectFeature.applyToActivity(activity);    }  
+    /**     * 在 Activity 恢复时应用所有需要的功能（双重保险）  
+     */    public static void onActivityResumed(Activity activity) {        ScreenshotProtectFeature.applyToActivity(activity);    }}  
+```
+
+**防截屏功能模块**：
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/feature/ScreenshotProtectFeature.java  
+public class ScreenshotProtectFeature {  
+    private static volatile boolean sEnabled = false;  
+    /**     * 为 Activity 应用防截屏保护（直接设置）  
+     * 使用 setFlags 而不是 addFlags，确保标志被正确设置  
+     */    public static void applyToActivity(Activity activity) {        if (!sEnabled || activity == null) {            return;        }  
+        try {            Window window = activity.getWindow();            if (window != null) {                // 使用 setFlags 确保 FLAG_SECURE 被正确设置  
+                window.setFlags(                    WindowManager.LayoutParams.FLAG_SECURE,                    WindowManager.LayoutParams.FLAG_SECURE                );                Log.d(TAG, "[SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to " + activity.getClass().getName());            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] ✗ Failed to apply FLAG_SECURE", t);        }    }  
+    /**     * 延迟应用防截屏保护（确保窗口已创建）  
+     * 在某些情况下，Activity 创建时窗口可能还未准备好，需要延迟设置  
+     */    public static void applyToActivityDelayed(Activity activity) {        if (!sEnabled || activity == null) {            return;        }  
+        try {            Window window = activity.getWindow();            if (window == null) {                // 如果窗口还未创建，使用 Handler 延迟重试  
+                android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());                handler.postDelayed(() -> applyToActivity(activity), 100);                return;            }  
+            android.view.View decorView = window.getDecorView();            if (decorView != null && decorView.isAttachedToWindow()) {                // 窗口已创建且已 attach，直接设置  
+                applyToActivity(activity);            } else if (decorView != null) {                // 窗口未 attach，等待 attach 后再设置  
+                decorView.post(() -> applyToActivity(activity));            } else {                // decorView 为 null，延迟重试  
+                android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());                handler.postDelayed(() -> applyToActivity(activity), 200);            }        } catch (Throwable t) {            Log.e(TAG, "[SCREENSHOT_PROTECT] Failed to apply FLAG_SECURE (delayed)", t);            applyToActivity(activity); // 失败时尝试直接设置  
+        }    }}  
+```
+
+#### 4.12.5 集成位置
+
+**在 ProxyComponentFactory.instantiateApplication() 中初始化**：
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  
+@Override  
+public Application instantiateApplication(@NonNull ClassLoader cl, @NonNull String className) {  
+    // ... 加载 shell SO 和初始化逻辑 ...    // 初始化功能管理器（根据配置启用/禁用各个功能）  
+    // 注意：如果应用使用了 AppComponentFactory，ProxyApplication.onCreate() 可能不会被调用  
+    // 所以需要在这里初始化功能管理器  
+    boolean rootDetectEnabled = JniBridge.isRootDetectEnabled();    boolean screenshotProtectEnabled = JniBridge.isScreenshotProtectEnabled();    FeatureManager.initialize(rootDetectEnabled, screenshotProtectEnabled);    // 创建原应用的 Application    Application app = ...;    // 在创建的 Application 上注册 ActivityLifecycleCallbacks    if (app != null) {        app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {            @Override            public void onActivityCreated(Activity activity, Bundle savedInstanceState) {                FeatureManager.onActivityCreated(activity);  // 第一重保护（延迟设置）  
+            }                        @Override  
+            public void onActivityResumed(Activity activity) {                FeatureManager.onActivityResumed(activity);  // 第二重保护（直接设置，双重保险）  
+            }            // ... 其他回调方法  
+        });    }        return app;  
+}  
+```
+
+**在 ProxyComponentFactory.instantiateActivity() 中应用**：
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java  
+@Override  
+public Activity instantiateActivity(@NonNull ClassLoader cl, @NonNull String className, Intent intent) {  
+    Activity activity = super.instantiateActivity(cl, className, intent);    // 应用功能到新创建的 Activity（第三重保护，确保覆盖）  
+    FeatureManager.onActivityCreated(activity);        return activity;  
+}  
+```
+
+#### 4.12.6 执行流程
+
+```  
+应用启动  
+    ↓ProxyComponentFactory.instantiateApplication()（Android 9+）  
+    ├─→ 加载 shell SO（JniBridge.loadShellLibs）  
+    │   └─→ JNI_OnLoad()（SO 加载时）  
+    │       ├─→ read_shell_config() 读取加密配置文件  
+    │       │   ├─→ 从 APK assets/d_shell_data_001 读取  
+    │       │   ├─→ AES 解密  
+    │       │   ├─→ 解析 JSON，读取 screenshot_protect 字段  
+    │       │   └─→ 设置 g_shell_config.screenshot_protect    │       │    │       └─→ 注册 JNI 方法（包括 isScreenshotProtectEnabled）  
+    │    ├─→ JniBridge.isScreenshotProtectEnabled() 查询配置  
+    ├─→ FeatureManager.initialize() 初始化功能管理器  
+    │   └─→ ScreenshotProtectFeature.enable() / disable()    │    ├─→ 创建原应用的 Application    └─→ 在 Application 上注册 ActivityLifecycleCallbacks        ├─→ onActivityCreated() → FeatureManager.onActivityCreated()        │   └─→ ScreenshotProtectFeature.applyToActivityDelayed()（第一重保护，延迟设置）  
+        │        └─→ onActivityResumed() → FeatureManager.onActivityResumed()            └─→ ScreenshotProtectFeature.applyToActivity()（第二重保护，直接设置，双重保险）  
+    ↓ProxyComponentFactory.instantiateActivity()  
+    └─→ FeatureManager.onActivityCreated()        └─→ ScreenshotProtectFeature.applyToActivityDelayed()（第三重保护，确保覆盖）  
+```
+
+#### 4.12.7 三重保险机制
+
+**为什么需要三重保险**：
+1. **Activity 创建时机**：某些 Activity 可能在 `onCreate()` 之后才设置窗口标志，需要再次确认
+2. **窗口准备时机**：Activity 创建时窗口可能还未完全准备好，需要延迟设置
+3. **Activity 恢复场景**：从后台恢复的 Activity 可能需要重新应用保护
+4. **兼容性考虑**：不同 Android 版本和厂商 ROM 的行为可能不同
+5. **AppComponentFactory 场景**：如果应用使用了 AppComponentFactory，需要在多个入口点应用保护
+
+**保护时机和方式**：
+- **第一重**：`ProxyComponentFactory.instantiateActivity()` 中应用（延迟设置，确保窗口已创建）
+    - 调用 `ScreenshotProtectFeature.applyToActivityDelayed()`
+    - 使用 `decorView.post()` 或 `Handler.postDelayed()` 延迟设置
+    - **第二重**：Application 的 `ActivityLifecycleCallbacks.onActivityCreated()` 回调中应用（延迟设置）
+    - 调用 `ScreenshotProtectFeature.applyToActivityDelayed()`
+    - 确保窗口已创建后再设置
+    - **第三重**：Application 的 `ActivityLifecycleCallbacks.onActivityResumed()` 回调中应用（直接设置，双重保险）
+    - 调用 `ScreenshotProtectFeature.applyToActivity()`
+    - 使用 `window.setFlags()` 直接设置，确保标志生效
+
+**技术细节**：
+- 使用 `window.setFlags()` 而不是 `addFlags()`，确保 `FLAG_SECURE` 被正确设置
+- 延迟设置机制：通过 `decorView.post()` 或 `Handler.postDelayed()` 确保窗口已创建
+- 直接设置机制：在 `onActivityResumed()` 时窗口已稳定，可以直接设置
+
+#### 4.12.8 JNI 接口
+
+**JNI 方法注册**：
+```cpp  
+// shell/src/main/cpp/dpt.cpp  
+static jboolean isScreenshotProtectEnabledJNI(__unused JNIEnv *env, jclass __unused) {  
+    return g_shell_config.screenshot_protect ? JNI_TRUE : JNI_FALSE;}  
+  
+static JNINativeMethod gMethods[] = {  
+    // ... 其他方法  
+    {"isScreenshotProtectEnabled", "()Z", (void *) isScreenshotProtectEnabledJNI},};  
+```
+
+**Java 层接口**：
+```java  
+// shell/src/main/java/com/luoyesiqiu/shell/JniBridge.java  
+public static native boolean isScreenshotProtectEnabled();  
+```
+
+#### 4.12.9 功能特点
+
+**优势**：
+1. ✅ **解耦设计**：防截屏功能独立模块，不影响其他功能
+2. ✅ **统一管理**：通过 `FeatureManager` 统一初始化和调用
+3. ✅ **配置驱动**：通过命令行参数和 JSON 配置控制功能开关
+4. ✅ **三重保险**：多时机应用保护，确保覆盖所有场景（延迟设置 + 直接设置）
+5. ✅ **易于扩展**：新增功能只需添加新模块并在 `FeatureManager` 中注册
+
+**限制**：
+- ✅ **已测试通过**：系统截屏快捷键（电源键+音量减）
+- ✅ **已测试通过**：系统录屏功能
+- ✅ **已测试通过**：Mumu 模拟器截屏
+- ❌ **无法防止**：物理拍照（相机拍摄屏幕）
+- ❌ **无法防止**：通过 ADB 命令截屏（`adb shell screencap`，需要 root 权限）
+- ❌ **无法防止**：某些第三方截屏工具（如果它们有系统权限或 root 权限）
+
+**说明**：
+- `FLAG_SECURE` 是 Android 系统级标志，只能防止系统级截屏和录屏
+- 对于物理拍照、ADB 截屏等需要特殊权限的操作，无法防止
+
+#### 4.12.10 测试建议
+
+1. **功能测试**：
+    - ✅ **系统截屏快捷键**：启用防截屏功能后，尝试使用电源键+音量减截屏，应提示"无法截屏"或"截屏失败"
+    - ✅ **系统录屏功能**：尝试使用系统录屏功能，应无法录制受保护的 Activity
+    - ✅ **模拟器测试**：在 Mumu、夜神等模拟器上测试截屏功能，应无法截屏
+    - ✅ **多 Activity 测试**：测试应用内所有 Activity 是否都受到保护
+
+2. **兼容性测试**：
+    - ✅ **Android 版本**：测试 Android 5.0+ 各版本（已验证 Android 12、13）
+    - ✅ **厂商 ROM**：测试不同厂商 ROM（MIUI、ColorOS、OneUI、原生 Android 等）
+    - ✅ **Activity 类型**：测试不同 Activity 类型（普通 Activity、Dialog Activity、透明 Activity、FragmentActivity 等）
+
+3. **性能测试**：
+    - ✅ **启动速度**：验证应用启动速度不受影响
+    - ✅ **切换流畅度**：验证 Activity 切换流畅度不受影响
+    - ✅ **内存占用**：验证功能不会增加明显的内存占用
+
+4. **日志验证**：
+    - 查看 logcat 中是否有 `[FEATURE]`、`[SCREENSHOT_PROTECT]` 相关日志
+    - 确认功能管理器已正确初始化
+    - 确认 `FLAG_SECURE` 已成功应用到所有 Activity
+    - 日志示例：
+```  
+     [FEATURE] Starting to initialize FeatureManager in ProxyComponentFactory...  
+     [FEATURE] isScreenshotProtectEnabled() returned: true     [FEATURE] FeatureManager initialized successfully     [SCREENSHOT_PROTECT] ✓ Successfully applied FLAG_SECURE to xxx.Activity     
+```
+#### 4.12.11 参考资源
+
+- **Android FLAG_SECURE 文档**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE
+- **Android 窗口标志**：https://developer.android.com/reference/android/view/WindowManager.LayoutParams
+
+### 4.13 SharePreferences/SQLite 加密
+
+**实现思路**：
+1. 自定义 SharedPreferences 和 SQLiteOpenHelper
+2. 在读写时自动加密/解密
+
+**实现方案**：
+- 使用 SQLCipher 加密数据库
+- 使用 AES 加密 SharedPreferences
+
+**参考资料**：
+- SQLCipher：https://www.zetetic.net/sqlcipher/
+- Android 数据加密：https://developer.android.com/training/articles/keystore
+
+---
+
+
+### 4.14 代理检测
+
+#### 4.14.1 实现思路
+
+代理检测旨在防止中间人攻击（MITM）和流量抓包分析。该功能通过 Native 层和 Java 层双重检测机制，识别常见的代理配置和拦截行为。当检测到代理时，App 会显示安全警告弹窗并强制退出。
+
+**检测方式**（综合 Native 和 Java）：
+1.  **Native Socket 检测** ✅（已实现）：尝试连接特定 IP（1.1.1.1:443）并设置极短超时，检测连接行为异常。
+2.  **系统属性检测 (Java)** ✅（已实现）：检查 `http.proxyHost` 和 `http.proxyPort` 系统属性。
+3.  **VPN 状态检测 (Java)** ✅（已实现）：通过 `ConnectivityManager` 检测是否存在 VPN 类型的网络连接。
+
+#### 4.14.2 代码结构设计
+
+**文件位置**：
+- `shell/src/main/cpp/dpt_risk.h`：添加函数声明
+- `shell/src/main/cpp/dpt_risk.cpp`：实现 Native 检测逻辑
+- `shell/src/main/java/com/luoyesiqiu/shell/ProxyComponentFactory.java`：实现 Java 检测逻辑及弹窗警告
+- `shell/src/main/java/com/luoyesiqiu/shell/JniBridge.java`：JNI 接口
+
+#### 4.14.3 检测方式详解
+
+**方式 1：Native Socket 检测 (透明代理/中间人检测)**  
+原理：在极短的超时时间（300ms）内尝试连接公网 IP（如 1.1.1.1:443）。如果这导致了非预期的连接错误（即非网络不可达、超时等常规错误），则认为可能存在代理或流量拦截。
+
+*注意*：为了防止在 Root 设备或防火墙环境下误报，以下错误码会被**忽略**（即视为非代理）：
+- `ENETUNREACH` (Network is unreachable)
+- `ETIMEDOUT` (Connection timed out)
+- `ECONNREFUSED` (Connection refused)
+- `EHOSTUNREACH` (No route to host)
+- `EACCES` (Permission denied, 如防火墙拦截)
+- `EPERM` (Operation not permitted)
+- `ENETDOWN` (Network is down)
+- `EINTR` (Interrupted system call)
+- `EINPROGRESS` (Operation now in progress)
+- `EALREADY` (Operation already in progress)
+
+```cpp  
+// shell/src/main/cpp/dpt_risk.cpp  
+bool detectSocketProxyNative() {  
+    int sock = socket(AF_INET, SOCK_STREAM, 0);    // ... 设置 300ms 超时 ...    int res = connect(sock, ..., sizeof(addr));    int err = errno;    close(sock);  
+    if (res != 0) {        // 忽略常见网络错误，避免误报  
+        if (err == ENETUNREACH || err == ETIMEDOUT || err == EACCES || ...) {            return false;        }        return true; // 其他异常错误视为可疑  
+    }    return false; // 连接成功视为正常  
+}  
+```
+
+**方式 2：系统属性检测 (显式代理配置)**  
+原理：读取 Android 系统属性 `http.proxyHost` 和 `http.proxyPort`。如果这两个属性不为空，说明用户在系统设置中配置了 HTTP 代理。
+
+```java  
+// ProxyComponentFactory.java  
+private static boolean checkSystemProxy() {  
+    String host = System.getProperty("http.proxyHost");    String port = System.getProperty("http.proxyPort");    return !TextUtils.isEmpty(host) && !TextUtils.isEmpty(port);}  
+```
+
+**方式 3：VPN 状态检测**  
+原理：使用 `ConnectivityManager` 检查当前激活的网络是否包含 `TRANSPORT_VPN` 能力。这可以检测到 VPN 应用（如抓包工具常见的 VPN 模式）。
+
+```java  
+// ProxyComponentFactory.java  
+private static boolean checkVpn() {  
+    ConnectivityManager cm = ...;    Network activeNetwork = cm.getActiveNetwork();    NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);    return caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN);}  
+```
+
+#### 4.14.4 警告与退出机制
+
+当检测到代理（任何一种方式命中）时，系统会触发警告流程：
+1.  **UI 弹窗**：在当前最顶层的 Activity 显示不可取消的警告对话框。
+2.  **强制退出**：用户点击“确定”或对话框显示后，应用会清除任务栈、杀掉进程并调用 `System.exit(0)`。
+3.  **冲突处理**：如果 Root 检测已经触发了警告，代理检测的警告将被抑制，优先显示 Root 警告。
+
+
+## 五、关键技术点总结
+
+### 5.1 Hook 框架
+- **Dobby**：用于 Hook ART 内部函数（DefineClass）
+- **bhook**：用于 Hook 系统库函数（mmap, execve）
+
+### 5.2 DEX 文件格式
+- CodeItem 结构：16 字节头部 + insns 数组
+- ClassData 结构：存储类的字段和方法信息
+- 需要理解 DEX 文件格式才能正确提取和填回
+
+### 5.3 内存管理
+- 使用 `mmap` Hook 使 DEX 内存可写
+- 使用 `mprotect` 修改内存权限
+
+### 5.4 多版本兼容
+- 支持 Android 5.0 - 14.0
+- 不同版本 ART 结构体不同，需要适配
+
+---
+
+
+## 六、参考资料
+
+1. **DEX 文件格式**：
+    - https://source.android.com/devices/tech/dalvik/dex-format
+
+2. **ART 虚拟机**：
+    - https://source.android.com/devices/tech/dalvik
+
+3. **Hook 技术**：
+    - Dobby：https://github.com/jmpews/Dobby
+    - bhook：https://github.com/bytedance/bhook
+
+4. **Android 安全**：
+    - https://developer.android.com/training/articles/security-tips
+
+5. **加固技术**：
+    - 看雪论坛：https://bbs.kanxue.com/
+    - 安全客：https://www.anquanke.com/
