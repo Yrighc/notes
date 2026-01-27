@@ -37,19 +37,43 @@ dev-dependencies = [
     "mypy>=1.8.0",
 ]
 
-# --- Ruff 配置 (uv 推荐的 Linter/Formatter) ---
+# --- Ruff 配置 (极速 Linter & Formatter) ---
 [tool.ruff]
 line-length = 88
 target-version = "py312"
+src = ["src"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]  # E: pycodestyle, F: Pyflakes, I: isort
+# 常用插件选择
+# E: pycodestyle, F: Pyflakes, I: isort, N: pep8-naming, UP: pyupgrade
+select = ["E", "F", "I", "N", "UP"]
+ignore = ["D100"] # 忽略缺失的 docstring
+fixable = ["ALL"]
 
-# --- Pytest 配置 ---
+[tool.ruff.lint.isort]
+known-first-party = ["my_project"]
+
+# --- MyPy 配置 (静态类型检查) ---
+[tool.mypy]
+python_version = "3.12"
+strict = true  # 开启严格模式
+warn_return_any = true
+warn_unused_configs = true
+show_error_codes = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# 针对没有类型注解的第三方库关闭检查
+module = ["some_untyped_library.*"]
+ignore_missing_imports = true
+
+# --- Pytest 配置 (单元测试) ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --cov=src"
+# 默认参数：显示详细输出、显示本地变量、计算覆盖率
+addopts = "-v --showlocals --cov=src --cov-report=term-missing"
+asyncio_mode = "auto"
 ```
 
 ### 关键点解析
