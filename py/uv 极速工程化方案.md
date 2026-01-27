@@ -1,27 +1,23 @@
-# uv 极速工程化方案
-## 一、 核心思路：Project-First
-在 `uv` 的体系下，我们不再把“Python 版本管理”和“项目依赖管理”分开。
+# Python 极速工程化方案 (Powered by uv)
 
-- **以前**：先用 `pyenv` 装 Python，再用 `venv` 建环境，再用 `pip` 装包。
-    
-- **现在**：你只管描述你的项目需要什么，`uv` 会自动把 Python 解释器、虚拟环境、依赖包全搞定。
-## 二、 从零创建工程 (Step-by-Step)
-假设我们要创建一个名为 `fast-api-service` 的后端项目。
-1. 初始化项目
-`uv init` 会直接生成标准的 `pyproject.toml` 和 `.python-version` 文件。
-```bash
-# 创建目录
-mkdir fast-api-service
-cd fast-api-service
+> **Version:** 1.0  
+> **Toolchain:** [uv](https://github.com/astral-sh/uv) (by Astral)  
+> **Philosophy:** Project-First, High Performance, Standards Compliant (PEP 621)
 
-# 初始化 (你会发现目录下多了一个 .venv，且它是自动生成的！)
-uv init
-```
-2. 锁定 Python 版本
-这是 `uv` 最爽的地方。你不需要去官网下载 Python，直接指定版本，它会自动下载并绑定到当前项目。
+## 1. 核心理念
+
+本方案旨在解决传统 Python 工程流中工具破碎（pip, venv, poetry, pyenv 各自为战）与依赖解析缓慢的问题。
+
+**uv 的核心优势：**
+* **All-in-One**：单一工具接管 Python 版本管理 (`pyenv`)、虚拟环境 (`venv`)、依赖解析 (`poetry`) 和包安装 (`pip`)。
+* **Rust Native**：依赖解析与安装速度比常规工具快 10-100 倍。
+* **Project-First**：基于项目声明自动下载对应的 Python Interpreter，无需全局安装。
+
+2.2 创建工程
+
+## 2. 项目初始化 (Zero to Hero)
+
+### 2.1 环境准备
+MacOS / Linux 一键安装 uv：
 ```bash
-# 强制项目使用 Python 3.12
-uv python pin 3.12
-```
-3. 调整为 Src-Layout (工程化标配)
-4. 
+curl -LsSf [https://astral-sh.github.io/uv/install.sh](https://astral-sh.github.io/uv/install.sh) | sh
